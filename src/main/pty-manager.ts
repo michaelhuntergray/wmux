@@ -314,7 +314,7 @@ function getDefaultShell(): string {
   if (cachedDefaultShell) return cachedDefaultShell;
   const candidates = process.platform === 'win32'
     ? ['pwsh.exe', 'powershell.exe', 'cmd.exe']
-    : [process.env.SHELL || '/bin/sh'];
+    : [process.env.SHELL, 'bash'].filter((s): s is string => !!s);
   for (const cmd of candidates) {
     const resolved = resolveExistingShellPath(cmd);
     if (resolved) {

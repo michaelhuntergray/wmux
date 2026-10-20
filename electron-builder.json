@@ -29,6 +29,17 @@
       { "target": "nsis", "arch": ["x64"] }
     ]
   },
+  "linux": {
+    "icon": "resources/icon.png",
+    "category": "Utility",
+    "maintainer": "Michael Gray <michael.h.gray.eng@gmail.com>",
+    "target": [
+      { "target": "AppImage", "arch": ["x64"] }
+    ]
+  },
+  "appImage": {
+    "artifactName": "wmux-${version}-x86_64.AppImage"
+  },
   "nsis": {
     "oneClick": false,
     "allowToChangeInstallationDirectory": true,

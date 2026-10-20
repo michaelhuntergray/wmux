@@ -1,4 +1,5 @@
 import net from 'net';
+import fs from 'fs';
 import { EventEmitter } from 'events';
 import { tokensMatch } from '../shared/instance';
 
@@ -132,7 +133,16 @@ export class PipeServer extends EventEmitter {
       });
     });
 
+    // A Unix socket outlives its process: unlink a stale file nobody answers on.
+    if (process.platform !== 'win32' && this.pipePath.startsWith('/') && fs.existsSync(this.pipePath)) {
+      const probe = net.connect({ path: this.pipePath });
+      probe.on('connect', () => probe.destroy());
+      probe.on('error', () => { try { fs.unlinkSync(this.pipePath); } catch { /* retried via EADDRINUSE */ } });
+    }
     this.server.listen(this.pipePath, () => {
+      if (process.platform !== 'win32' && this.pipePath.startsWith('/')) {
+        try { fs.chmodSync(this.pipePath, 0o600); } catch { /* best-effort */ }
+      }
       console.log(`wmux pipe server listening on ${this.pipePath}`);
     });
 

@@ -4,6 +4,8 @@
   "description": "Windows terminal multiplexer for AI agents",
   "license": "MIT",
   "main": "dist/main/index.js",
+  "author": "Michael Gray <michael.h.gray.eng@gmail.com>",
+  "homepage": "https://github.com/michaelhuntergray/wmux",
   "bin": {
     "wmux": "dist/cli/wmux.js"
   },
