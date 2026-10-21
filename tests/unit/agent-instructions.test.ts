@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import {
   CLI_BIN_PLACEHOLDER,
+  getCliBinDirForInstructions,
   getInstructionsPath,
   renderInstructions,
 } from '../../src/main/agent-instructions';
@@ -61,5 +62,17 @@ describe('agent instruction block (issue #158)', () => {
     // absolute probe also fails, the reader is told plainly to use normal tools.
     expect(raw).toMatch(/If it too does not answer `pong`, wmux is not\s+running for this\s+session/);
     expect(raw).toMatch(/Nothing here is a\s+restriction on what you may otherwise do/);
+  });
+});
+
+describe('cli-bin dir written into the block on Linux (MIC-627)', () => {
+  it('points an AppImage at the stable ~/.local/bin link, not the per-launch mount', () => {
+    const dir = getCliBinDirForInstructions('linux', { APPIMAGE: '/home/u/Applications/wmux.AppImage', HOME: '/home/u' });
+    expect(dir.replace(/\\/g, '/')).toBe('/home/u/.local/bin');
+  });
+
+  it('keeps the install path when not an AppImage', () => {
+    expect(getCliBinDirForInstructions('linux', { HOME: '/home/u' })).not.toMatch(/\.local[\\/]bin$/);
+    expect(getCliBinDirForInstructions('win32', { APPIMAGE: 'x', HOME: 'C:\\u' })).not.toMatch(/\.local[\\/]bin$/);
   });
 });

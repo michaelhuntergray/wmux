@@ -10,6 +10,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { getCliBinPath } from './cli-paths';
 
 /**
@@ -43,7 +44,16 @@ import { getCliBinPath } from './cli-paths';
 export const CLI_BIN_PLACEHOLDER = '{{WMUX_CLI_BIN}}';
 
 /** Absolute path to the `wmux` entry point a session off PATH should call. */
-export function getCliBinDirForInstructions(): string {
+export function getCliBinDirForInstructions(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  // Linux AppImage: resourcesPath is a fresh /tmp/.mount_* dir each launch, so a
+  // path written into a global file would dangle once wmux restarts. Point at the
+  // stable link the installer makes (~/.local/bin/wmux → the extracted cli/wmux.js).
+  if (platform === 'linux' && env.APPIMAGE) {
+    return path.join(env.HOME || os.homedir(), '.local', 'bin');
+  }
   return getCliBinPath();
 }
 
