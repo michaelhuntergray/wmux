@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { PipeServer, clearStaleSocket, isUnixSocketPath } from '../../src/main/pipe-server';
 import { defaultShellCandidates } from '../../src/main/pty-manager';
+import { ensureAppImageCliLink } from '../../src/main/cli-paths';
 
 // MIC-627: Linux behaviour of the socket and shell selection. The socket tests
 // need a real Unix socket, so they run only off Windows (CI's Linux job).
@@ -28,6 +29,48 @@ describe('isUnixSocketPath', () => {
     expect(isUnixSocketPath('/run/user/1000/wmux.sock', 'linux')).toBe(true);
     expect(isUnixSocketPath('\\\\.\\pipe\\wmux', 'win32')).toBe(false);
     expect(isUnixSocketPath('/x', 'win32')).toBe(false);
+  });
+});
+
+describe('AppImage CLI link', () => {
+  let home: string;
+  afterEach(() => { if (home) fs.rmSync(home, { recursive: true, force: true }); });
+
+  const setup = (fresh = true) => {
+    if (fresh) home = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-home-'));
+    const res = path.join(home, 'mount', 'resources');
+    fs.mkdirSync(path.join(res, 'cli', 'node_modules', 'ws'), { recursive: true });
+    fs.writeFileSync(path.join(res, 'cli', 'wmux.js'), '#!/usr/bin/env node\n');
+    return res;
+  };
+  const env = () => ({ APPIMAGE: '/x/wmux.AppImage', HOME: home });
+
+  it('does nothing off an AppImage', () => {
+    const res = setup();
+    expect(ensureAppImageCliLink('linux', { HOME: home }, res)).toBeUndefined();
+    expect(ensureAppImageCliLink('win32', env(), res)).toBeUndefined();
+  });
+
+  it.runIf(unix)('copies the CLI out of the mount and links ~/.local/bin/wmux to it', () => {
+    const res = setup();
+    const link = ensureAppImageCliLink('linux', env(), res)!;
+    expect(link).toBe(path.join(home, '.local', 'bin', 'wmux'));
+    const target = fs.readlinkSync(link);
+    expect(target).toBe(path.join(home, '.local', 'share', 'wmux', 'cli', 'wmux.js'));
+    expect(fs.existsSync(path.join(home, '.local', 'share', 'wmux', 'cli', 'node_modules', 'ws'))).toBe(true);
+    // the copy survives the mount going away
+    fs.rmSync(path.join(home, 'mount'), { recursive: true });
+    expect(fs.statSync(link).mode & 0o111).toBeTruthy();
+    // a second launch replaces its own link
+    expect(ensureAppImageCliLink('linux', env(), setup(false))).toBe(link);
+  });
+
+  it.runIf(unix)('leaves a real file at ~/.local/bin/wmux alone', () => {
+    const res = setup();
+    fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.local', 'bin', 'wmux'), 'mine');
+    expect(ensureAppImageCliLink('linux', env(), res)).toBeUndefined();
+    expect(fs.readFileSync(path.join(home, '.local', 'bin', 'wmux'), 'utf-8')).toBe('mine');
   });
 });
 

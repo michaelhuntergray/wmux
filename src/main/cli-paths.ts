@@ -7,7 +7,43 @@
  * context writers, which have to tell a session that is NOT inside a pane where
  * to find the CLI (issue #158).
  */
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * Linux AppImage only: copy the bundled CLI out of the per-launch /tmp/.mount_*
+ * dir to ~/.local/share/wmux/cli and link ~/.local/bin/wmux to it, so the path
+ * the agent block names (getCliBinDirForInstructions) exists after the mount is
+ * gone. Re-run every launch so an updated AppImage refreshes the copy. A real
+ * file at the link path is the user's and is left alone. Returns the link path,
+ * or undefined when nothing was done.
+ */
+export function ensureAppImageCliLink(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  resourcesPath: string = process.resourcesPath,
+): string | undefined {
+  if (platform !== 'linux' || !env.APPIMAGE || !resourcesPath) return undefined;
+  const home = env.HOME || os.homedir();
+  const src = path.join(resourcesPath, 'cli');
+  if (!fs.existsSync(path.join(src, 'wmux.js'))) return undefined;
+  const dest = path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'wmux', 'cli');
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, dest, { recursive: true });
+  const cli = path.join(dest, 'wmux.js');
+  fs.chmodSync(cli, 0o755);
+  const bin = path.join(home, '.local', 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const link = path.join(bin, 'wmux');
+  let existing: fs.Stats | undefined;
+  try { existing = fs.lstatSync(link); } catch { /* absent */ }
+  if (existing && !existing.isSymbolicLink()) return undefined;
+  if (existing) fs.unlinkSync(link);
+  fs.symlinkSync(cli, link);
+  return link;
+}
 
 /**
  * Dir holding the `wmux`/`wmux.cmd` shims (each runs `node $WMUX_CLI`).
