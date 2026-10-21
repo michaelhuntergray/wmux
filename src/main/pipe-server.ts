@@ -61,6 +61,10 @@ export function isUnixSocketPath(p: string, platform: NodeJS.Platform = process.
   return platform !== 'win32' && p.startsWith('/');
 }
 
+function isSocketFile(p: string): boolean {
+  try { return fs.lstatSync(p).isSocket(); } catch { return false; }
+}
+
 /**
  * Resolve once `socketPath` is free to listen on: unlink it when nothing answers
  * (a crashed instance's leftover), leave it when a live server does (listen then
@@ -174,11 +178,18 @@ export class PipeServer extends EventEmitter {
 
     this.server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
+        // A non-socket file at the path is someone's data: never delete it, and
+        // retrying cannot succeed, so report it once and give up.
+        if (unixSocket && !isSocketFile(this.pipePath)) {
+          console.error(`wmux pipe server: ${this.pipePath} exists and is not a socket; not starting`);
+          this.emit('listen-error', err);
+          return;
+        }
         // Pipe already exists, try to clean up and retry
         net.connect({ path: this.pipePath }, () => {}).on('error', () => {
           // No one is listening, safe to unlink and retry
           if (unixSocket) {
-            try { if (fs.lstatSync(this.pipePath).isSocket()) fs.unlinkSync(this.pipePath); } catch { /* already gone */ }
+            try { if (isSocketFile(this.pipePath)) fs.unlinkSync(this.pipePath); } catch { /* already gone */ }
           }
           this.server?.close();
           // On Windows, just retry after a short delay

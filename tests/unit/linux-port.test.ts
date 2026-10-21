@@ -139,6 +139,18 @@ describe.runIf(unix)('Unix socket startup', () => {
     expect(fs.existsSync(sock)).toBe(true);
   });
 
+  it('refuses to start over a regular file, keeps it, and does not retry', async () => {
+    const sock = tmpSock();
+    fs.writeFileSync(sock, 'data');
+    server = new PipeServer(sock);
+    let errors = 0;
+    server.on('listen-error', () => errors++);
+    server.start();
+    await new Promise((r) => setTimeout(r, 1500)); // past several 500 ms retry periods
+    expect(errors).toBe(1);
+    expect(fs.readFileSync(sock, 'utf-8')).toBe('data');
+  });
+
   it('starts over a stale socket and answers ping with mode 600', async () => {
     const sock = tmpSock();
     staleSocket(sock);
