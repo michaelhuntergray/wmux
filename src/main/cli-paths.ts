@@ -35,20 +35,32 @@ export function ensureAppImageCliLink(
   const src = path.join(resourcesPath, 'cli');
   if (!fs.existsSync(path.join(src, 'wmux.js'))) return undefined;
   const dest = getAppImageCliDir(env);
-  fs.rmSync(dest, { recursive: true, force: true });
+  // Build the new copy beside the old one and swap it in only once complete, so a
+  // failed copy never leaves the stable path empty.
+  const tmp = `${dest}.new-${process.pid}`;
+  const old = `${dest}.old-${process.pid}`;
+  fs.rmSync(tmp, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.cpSync(src, dest, { recursive: true });
-  const cli = path.join(dest, 'wmux.js');
-  fs.chmodSync(cli, 0o755);
+  fs.cpSync(src, tmp, { recursive: true });
+  fs.chmodSync(path.join(tmp, 'wmux.js'), 0o755);
   // `<dir>/wmux` is what the agent block calls, so the copy dir works without the PATH link.
-  fs.symlinkSync('wmux.js', path.join(dest, 'wmux'));
+  fs.symlinkSync('wmux.js', path.join(tmp, 'wmux'));
+  if (fs.existsSync(dest)) fs.renameSync(dest, old);
+  fs.renameSync(tmp, dest);
+  fs.rmSync(old, { recursive: true, force: true });
+  const cli = path.join(dest, 'wmux.js');
   const bin = path.join(home, '.local', 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const link = path.join(bin, 'wmux');
   let existing: fs.Stats | undefined;
   try { existing = fs.lstatSync(link); } catch { /* absent */ }
-  if (existing && !existing.isSymbolicLink()) return undefined;
-  if (existing) fs.unlinkSync(link);
+  if (existing) {
+    // Replace only our own link (it points into the copy dir); anything else belongs to someone else.
+    if (!existing.isSymbolicLink() || path.resolve(bin, fs.readlinkSync(link)) !== cli) {
+      return undefined;
+    }
+    return link;
+  }
   fs.symlinkSync(cli, link);
   return link;
 }

@@ -12,12 +12,12 @@ import { ensureAppImageCliLink } from '../../src/main/cli-paths';
 const unix = process.platform !== 'win32';
 
 describe('default shell candidates', () => {
-  it('prefers bash, then $SHELL, off Windows', () => {
-    expect(defaultShellCandidates('linux', { SHELL: '/usr/bin/fish' })).toEqual(['bash', '/usr/bin/fish']);
+  it('prefers bash, then $SHELL, then /bin/sh, off Windows', () => {
+    expect(defaultShellCandidates('linux', { SHELL: '/usr/bin/fish' })).toEqual(['bash', '/usr/bin/fish', '/bin/sh']);
   });
-  it('drops an unset or duplicate $SHELL', () => {
-    expect(defaultShellCandidates('linux', {})).toEqual(['bash']);
-    expect(defaultShellCandidates('linux', { SHELL: 'bash' })).toEqual(['bash']);
+  it('drops an unset or duplicate $SHELL but keeps /bin/sh', () => {
+    expect(defaultShellCandidates('linux', {})).toEqual(['bash', '/bin/sh']);
+    expect(defaultShellCandidates('linux', { SHELL: 'bash' })).toEqual(['bash', '/bin/sh']);
   });
   it('keeps the Windows order', () => {
     expect(defaultShellCandidates('win32', { SHELL: '/bin/zsh' })).toEqual(['pwsh.exe', 'powershell.exe', 'cmd.exe']);
@@ -65,6 +65,17 @@ describe('AppImage CLI link', () => {
     expect(fs.statSync(link).mode & 0o111).toBeTruthy();
     // a second launch replaces its own link
     expect(ensureAppImageCliLink('linux', env(), setup(false))).toBe(link);
+  });
+
+  it.runIf(unix)('leaves a symlink to another wmux alone, and keeps no temp dirs', () => {
+    const res = setup();
+    fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true });
+    fs.symlinkSync('/opt/other/wmux', path.join(home, '.local', 'bin', 'wmux'));
+    expect(ensureAppImageCliLink('linux', env(), res)).toBeUndefined();
+    expect(fs.readlinkSync(path.join(home, '.local', 'bin', 'wmux'))).toBe('/opt/other/wmux');
+    // the copy itself is still refreshed, and the swap leaves nothing behind
+    expect(fs.existsSync(path.join(home, '.local', 'share', 'wmux', 'cli', 'wmux.js'))).toBe(true);
+    expect(fs.readdirSync(path.join(home, '.local', 'share', 'wmux'))).toEqual(['cli']);
   });
 
   it.runIf(unix)('leaves a real file at ~/.local/bin/wmux alone', () => {
