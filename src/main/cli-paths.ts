@@ -45,8 +45,15 @@ export function ensureAppImageCliLink(
   fs.chmodSync(path.join(tmp, 'wmux.js'), 0o755);
   // `<dir>/wmux` is what the agent block calls, so the copy dir works without the PATH link.
   fs.symlinkSync('wmux.js', path.join(tmp, 'wmux'));
-  if (fs.existsSync(dest)) fs.renameSync(dest, old);
-  fs.renameSync(tmp, dest);
+  const hadOld = fs.existsSync(dest);
+  if (hadOld) fs.renameSync(dest, old);
+  try {
+    fs.renameSync(tmp, dest);
+  } catch (err) {
+    if (hadOld) fs.renameSync(old, dest); // put the working copy back
+    fs.rmSync(tmp, { recursive: true, force: true });
+    throw err;
+  }
   fs.rmSync(old, { recursive: true, force: true });
   const cli = path.join(dest, 'wmux.js');
   const bin = path.join(home, '.local', 'bin');

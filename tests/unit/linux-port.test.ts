@@ -3,6 +3,7 @@ import fs from 'fs';
 import net from 'net';
 import os from 'os';
 import path from 'path';
+import { spawnSync } from 'child_process';
 import { PipeServer, clearStaleSocket, isUnixSocketPath } from '../../src/main/pipe-server';
 import { defaultShellCandidates } from '../../src/main/pty-manager';
 import { ensureAppImageCliLink } from '../../src/main/cli-paths';
@@ -110,11 +111,24 @@ describe.runIf(unix)('Unix socket startup', () => {
     c.on('error', reject);
   });
 
-  it('unlinks a stale socket file nobody answers on', async () => {
+  // A process that exits without closing its server leaves the socket file behind.
+  const staleSocket = (p: string) => {
+    spawnSync(process.execPath, ['-e', `require('net').createServer().listen(${JSON.stringify(p)}, () => process.exit(0))`]);
+    expect(fs.lstatSync(p).isSocket()).toBe(true);
+  };
+
+  it('unlinks a stale socket nobody answers on', async () => {
     const sock = tmpSock();
-    fs.writeFileSync(sock, '');
+    staleSocket(sock);
     await clearStaleSocket(sock);
     expect(fs.existsSync(sock)).toBe(false);
+  });
+
+  it('never deletes a regular file at the socket path', async () => {
+    const sock = tmpSock();
+    fs.writeFileSync(sock, 'data');
+    await clearStaleSocket(sock);
+    expect(fs.readFileSync(sock, 'utf-8')).toBe('data');
   });
 
   it('leaves a live socket alone', async () => {
@@ -125,9 +139,9 @@ describe.runIf(unix)('Unix socket startup', () => {
     expect(fs.existsSync(sock)).toBe(true);
   });
 
-  it('starts over a stale socket file and answers ping with mode 600', async () => {
+  it('starts over a stale socket and answers ping with mode 600', async () => {
     const sock = tmpSock();
-    fs.writeFileSync(sock, '');
+    staleSocket(sock);
     server = new PipeServer(sock);
     server.start();
     await new Promise((r) => setTimeout(r, 300));

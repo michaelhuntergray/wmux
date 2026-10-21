@@ -68,7 +68,10 @@ export function isUnixSocketPath(p: string, platform: NodeJS.Platform = process.
  */
 export function clearStaleSocket(socketPath: string): Promise<void> {
   return new Promise((resolve) => {
-    if (!fs.existsSync(socketPath)) return resolve();
+    let st: fs.Stats;
+    try { st = fs.lstatSync(socketPath); } catch { return resolve(); }
+    // Only a socket is ours to remove; any other file is left for listen() to report.
+    if (!st.isSocket()) return resolve();
     const probe = net.connect({ path: socketPath });
     probe.once('connect', () => { probe.destroy(); resolve(); });
     probe.once('error', () => {
@@ -174,7 +177,9 @@ export class PipeServer extends EventEmitter {
         // Pipe already exists, try to clean up and retry
         net.connect({ path: this.pipePath }, () => {}).on('error', () => {
           // No one is listening, safe to unlink and retry
-          if (unixSocket) { try { fs.unlinkSync(this.pipePath); } catch { /* already gone */ } }
+          if (unixSocket) {
+            try { if (fs.lstatSync(this.pipePath).isSocket()) fs.unlinkSync(this.pipePath); } catch { /* already gone */ }
+          }
           this.server?.close();
           // On Windows, just retry after a short delay
           setTimeout(() => this.start(), 500);
