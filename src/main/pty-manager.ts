@@ -310,11 +310,19 @@ function resolveBashAlias(shell: string, alias: 'bash' | 'git-bash'): string | u
   return gitBashProbe.find() ?? hit;
 }
 
+/** Default-shell search order. Off Windows bash comes first (the shell integration
+ *  and hooks are written for it); $SHELL, then /bin/sh, when bash is missing. */
+export function defaultShellCandidates(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (platform === 'win32') return ['pwsh.exe', 'powershell.exe', 'cmd.exe'];
+  return ['bash', env.SHELL, '/bin/sh'].filter((s, i, a): s is string => !!s && a.indexOf(s) === i);
+}
+
 function getDefaultShell(): string {
   if (cachedDefaultShell) return cachedDefaultShell;
-  const candidates = process.platform === 'win32'
-    ? ['pwsh.exe', 'powershell.exe', 'cmd.exe']
-    : [process.env.SHELL || '/bin/sh'];
+  const candidates = defaultShellCandidates();
   for (const cmd of candidates) {
     const resolved = resolveExistingShellPath(cmd);
     if (resolved) {

@@ -7,7 +7,70 @@
  * context writers, which have to tell a session that is NOT inside a pane where
  * to find the CLI (issue #158).
  */
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+
+/** Stable home of the AppImage's CLI copy (holds wmux.js and a `wmux` link to it). */
+export function getAppImageCliDir(env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.HOME || os.homedir();
+  return path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'wmux', 'cli');
+}
+
+/**
+ * Linux AppImage only: copy the bundled CLI out of the per-launch /tmp/.mount_*
+ * dir to ~/.local/share/wmux/cli and link ~/.local/bin/wmux to it, so the path
+ * the agent block names (getCliBinDirForInstructions) exists after the mount is
+ * gone. Re-run every launch so an updated AppImage refreshes the copy. A real
+ * file at the link path is the user's and is left alone. Returns the link path,
+ * or undefined when nothing was done.
+ */
+export function ensureAppImageCliLink(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  resourcesPath: string = process.resourcesPath,
+): string | undefined {
+  if (platform !== 'linux' || !env.APPIMAGE || !resourcesPath) return undefined;
+  const home = env.HOME || os.homedir();
+  const src = path.join(resourcesPath, 'cli');
+  if (!fs.existsSync(path.join(src, 'wmux.js'))) return undefined;
+  const dest = getAppImageCliDir(env);
+  // Build the new copy beside the old one and swap it in only once complete, so a
+  // failed copy never leaves the stable path empty.
+  const tmp = `${dest}.new-${process.pid}`;
+  const old = `${dest}.old-${process.pid}`;
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, tmp, { recursive: true });
+  fs.chmodSync(path.join(tmp, 'wmux.js'), 0o755);
+  // `<dir>/wmux` is what the agent block calls, so the copy dir works without the PATH link.
+  fs.symlinkSync('wmux.js', path.join(tmp, 'wmux'));
+  const hadOld = fs.existsSync(dest);
+  if (hadOld) fs.renameSync(dest, old);
+  try {
+    fs.renameSync(tmp, dest);
+  } catch (err) {
+    if (hadOld) fs.renameSync(old, dest); // put the working copy back
+    fs.rmSync(tmp, { recursive: true, force: true });
+    throw err;
+  }
+  fs.rmSync(old, { recursive: true, force: true });
+  const cli = path.join(dest, 'wmux.js');
+  const bin = path.join(home, '.local', 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const link = path.join(bin, 'wmux');
+  let existing: fs.Stats | undefined;
+  try { existing = fs.lstatSync(link); } catch { /* absent */ }
+  if (existing) {
+    // Replace only our own link (it points into the copy dir); anything else belongs to someone else.
+    if (!existing.isSymbolicLink() || path.resolve(bin, fs.readlinkSync(link)) !== cli) {
+      return undefined;
+    }
+    return link;
+  }
+  fs.symlinkSync(cli, link);
+  return link;
+}
 
 /**
  * Dir holding the `wmux`/`wmux.cmd` shims (each runs `node $WMUX_CLI`).

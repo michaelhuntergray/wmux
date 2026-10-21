@@ -1,4 +1,5 @@
 import net from 'net';
+import fs from 'fs';
 import { EventEmitter } from 'events';
 import { tokensMatch } from '../shared/instance';
 
@@ -54,6 +55,34 @@ function parseV1Args(command: string, argsRaw: string): string[] {
     default:
       return argsRaw ? argsRaw.split(/\s+/) : [];
   }
+}
+
+export function isUnixSocketPath(p: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32' && p.startsWith('/');
+}
+
+function isSocketFile(p: string): boolean {
+  try { return fs.lstatSync(p).isSocket(); } catch { return false; }
+}
+
+/**
+ * Resolve once `socketPath` is free to listen on: unlink it when nothing answers
+ * (a crashed instance's leftover), leave it when a live server does (listen then
+ * reports EADDRINUSE and the retry path takes over).
+ */
+export function clearStaleSocket(socketPath: string): Promise<void> {
+  return new Promise((resolve) => {
+    let st: fs.Stats;
+    try { st = fs.lstatSync(socketPath); } catch { return resolve(); }
+    // Only a socket is ours to remove; any other file is left for listen() to report.
+    if (!st.isSocket()) return resolve();
+    const probe = net.connect({ path: socketPath });
+    probe.once('connect', () => { probe.destroy(); resolve(); });
+    probe.once('error', () => {
+      try { fs.unlinkSync(socketPath); } catch { /* retried via EADDRINUSE */ }
+      resolve();
+    });
+  });
 }
 
 export class PipeServer extends EventEmitter {
@@ -132,15 +161,36 @@ export class PipeServer extends EventEmitter {
       });
     });
 
-    this.server.listen(this.pipePath, () => {
-      console.log(`wmux pipe server listening on ${this.pipePath}`);
-    });
+    const server = this.server;
+    const unixSocket = isUnixSocketPath(this.pipePath);
+    const listen = () => {
+      if (this.server !== server) return; // stopped while the stale-socket probe ran
+      server.listen(this.pipePath, () => {
+        if (unixSocket) {
+          try { fs.chmodSync(this.pipePath, 0o600); } catch { /* best-effort */ }
+        }
+        console.log(`wmux pipe server listening on ${this.pipePath}`);
+      });
+    };
+    // A Unix socket outlives its process: listen only after a stale file is gone.
+    if (unixSocket) void clearStaleSocket(this.pipePath).then(listen);
+    else listen();
 
     this.server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
+        // A non-socket file at the path is someone's data: never delete it, and
+        // retrying cannot succeed, so report it once and give up.
+        if (unixSocket && !isSocketFile(this.pipePath)) {
+          console.error(`wmux pipe server: ${this.pipePath} exists and is not a socket; not starting`);
+          this.emit('listen-error', err);
+          return;
+        }
         // Pipe already exists, try to clean up and retry
         net.connect({ path: this.pipePath }, () => {}).on('error', () => {
           // No one is listening, safe to unlink and retry
+          if (unixSocket) {
+            try { if (isSocketFile(this.pipePath)) fs.unlinkSync(this.pipePath); } catch { /* already gone */ }
+          }
           this.server?.close();
           // On Windows, just retry after a short delay
           setTimeout(() => this.start(), 500);

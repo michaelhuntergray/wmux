@@ -80,6 +80,7 @@ import { startOrchestrationWatcher } from './orchestration-watcher';
 import { readMarkdownFile } from './markdown-file';
 import { grantFilePath, clearFileGrants } from './file-grants';
 import { directoryFromArgv } from './shell-context-menu';
+import { ensureAppImageCliLink } from './cli-paths';
 import { reportExplorerCwd } from './explorer-roots';
 import { ensurePowerShellShim } from './powershell-shim';
 import { loadSettings } from './settings-store';
@@ -1431,6 +1432,10 @@ process.on('uncaughtExceptionMonitor', (err: unknown) => {
 app.whenReady().then(() => {
   // A losing second instance is already quitting; don't run startup side effects.
   if (!gotInstanceLock) return;
+
+  // Linux AppImage: give sessions off a pane a stable `wmux` (~/.local/bin/wmux),
+  // which the agent block points at (MIC-627).
+  try { ensureAppImageCliLink(); } catch (err) { console.warn('[wmux] CLI link setup failed:', err); }
 
   // First line of the run, so a crash report can state what this process was
   // rather than infer it (#150). `guard` in particular: whether the node-pty

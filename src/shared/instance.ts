@@ -17,11 +17,20 @@ function suffix(): string {
 }
 
 export function getPipePath(): string {
+  // Linux: a Unix socket in the per-user runtime dir (the CLI restates this
+  // rule, since it ships file by file — keep src/cli/wmux.ts and wmux-hook.ts in step).
+  if (process.platform !== 'win32') {
+    const dir = process.env.XDG_RUNTIME_DIR || os.tmpdir();
+    return path.join(dir, `wmux${suffix()}.sock`);
+  }
   return `\\\\.\\pipe\\wmux${suffix()}`;
 }
 
 export function getAppDataDir(): string {
-  const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const base = process.env.APPDATA
+    || (process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Roaming')
+      : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
   return path.join(base, `wmux${suffix()}`);
 }
 

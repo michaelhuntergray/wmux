@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   CLI_BIN_PLACEHOLDER,
+  getCliBinDirForInstructions,
   getInstructionsPath,
   renderInstructions,
 } from '../../src/main/agent-instructions';
@@ -61,5 +64,24 @@ describe('agent instruction block (issue #158)', () => {
     // absolute probe also fails, the reader is told plainly to use normal tools.
     expect(raw).toMatch(/If it too does not answer `pong`, wmux is not\s+running for this\s+session/);
     expect(raw).toMatch(/Nothing here is a\s+restriction on what you may otherwise do/);
+  });
+});
+
+describe('cli-bin dir written into the block on Linux (MIC-627)', () => {
+  it('points an AppImage at the stable CLI copy, not the per-launch mount', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-ai-'));
+    try {
+      const dir = path.join(home, '.local', 'share', 'wmux', 'cli');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'wmux'), '');
+      expect(getCliBinDirForInstructions('linux', { APPIMAGE: '/a/wmux.AppImage', HOME: home })).toBe(dir);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('falls back to the install path when the copy is missing or not an AppImage', () => {
+    const missing = path.join(os.tmpdir(), 'wmux-no-such-home');
+    expect(getCliBinDirForInstructions('linux', { APPIMAGE: '/a/wmux.AppImage', HOME: missing })).not.toContain('wmux-no-such-home');
+    expect(getCliBinDirForInstructions('linux', { HOME: '/home/u' })).not.toMatch(/share[\\/]wmux/);
+    expect(getCliBinDirForInstructions('win32', { APPIMAGE: 'x', HOME: 'C:\\u' })).not.toMatch(/share[\\/]wmux/);
   });
 });

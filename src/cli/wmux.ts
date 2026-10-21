@@ -61,7 +61,9 @@ function readWslNetworkingMode(): string | null {
 
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
-const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
+const PIPE_PATH = process.env.WMUX_PIPE || (process.platform === 'win32'
+  ? '\\\\.\\pipe\\wmux'
+  : `${process.env.XDG_RUNTIME_DIR || require('os').tmpdir()}/wmux${process.env.WMUX_INSTANCE?.trim() ? '-' + process.env.WMUX_INSTANCE.trim() : ''}.sock`);
 
 // ─── Remote transport (issue #78: remote wmux management) ────────────────────
 // When --remote host[:port] (or WMUX_REMOTE) is set, every command connects
