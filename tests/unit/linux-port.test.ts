@@ -58,6 +58,8 @@ describe('AppImage CLI link', () => {
     const target = fs.readlinkSync(link);
     expect(target).toBe(path.join(home, '.local', 'share', 'wmux', 'cli', 'wmux.js'));
     expect(fs.existsSync(path.join(home, '.local', 'share', 'wmux', 'cli', 'node_modules', 'ws'))).toBe(true);
+    // the dir the agent block names has its own `wmux`, independent of the PATH link
+    expect(fs.readlinkSync(path.join(home, '.local', 'share', 'wmux', 'cli', 'wmux'))).toBe('wmux.js');
     // the copy survives the mount going away
     fs.rmSync(path.join(home, 'mount'), { recursive: true });
     expect(fs.statSync(link).mode & 0o111).toBeTruthy();

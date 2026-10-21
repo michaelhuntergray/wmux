@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   CLI_BIN_PLACEHOLDER,
   getCliBinDirForInstructions,
@@ -66,13 +68,20 @@ describe('agent instruction block (issue #158)', () => {
 });
 
 describe('cli-bin dir written into the block on Linux (MIC-627)', () => {
-  it('points an AppImage at the stable ~/.local/bin link, not the per-launch mount', () => {
-    const dir = getCliBinDirForInstructions('linux', { APPIMAGE: '/home/u/Applications/wmux.AppImage', HOME: '/home/u' });
-    expect(dir.replace(/\\/g, '/')).toBe('/home/u/.local/bin');
+  it('points an AppImage at the stable CLI copy, not the per-launch mount', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-ai-'));
+    try {
+      const dir = path.join(home, '.local', 'share', 'wmux', 'cli');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'wmux'), '');
+      expect(getCliBinDirForInstructions('linux', { APPIMAGE: '/a/wmux.AppImage', HOME: home })).toBe(dir);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
-  it('keeps the install path when not an AppImage', () => {
-    expect(getCliBinDirForInstructions('linux', { HOME: '/home/u' })).not.toMatch(/\.local[\\/]bin$/);
-    expect(getCliBinDirForInstructions('win32', { APPIMAGE: 'x', HOME: 'C:\\u' })).not.toMatch(/\.local[\\/]bin$/);
+  it('falls back to the install path when the copy is missing or not an AppImage', () => {
+    const missing = path.join(os.tmpdir(), 'wmux-no-such-home');
+    expect(getCliBinDirForInstructions('linux', { APPIMAGE: '/a/wmux.AppImage', HOME: missing })).not.toContain('wmux-no-such-home');
+    expect(getCliBinDirForInstructions('linux', { HOME: '/home/u' })).not.toMatch(/share[\\/]wmux/);
+    expect(getCliBinDirForInstructions('win32', { APPIMAGE: 'x', HOME: 'C:\\u' })).not.toMatch(/share[\\/]wmux/);
   });
 });

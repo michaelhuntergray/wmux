@@ -10,8 +10,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { getCliBinPath } from './cli-paths';
+import { getAppImageCliDir, getCliBinPath } from './cli-paths';
 
 /**
  * Placeholder replaced with this install's absolute cli-bin directory.
@@ -50,9 +49,11 @@ export function getCliBinDirForInstructions(
 ): string {
   // Linux AppImage: resourcesPath is a fresh /tmp/.mount_* dir each launch, so a
   // path written into a global file would dangle once wmux restarts. Point at the
-  // stable link the installer makes (~/.local/bin/wmux → the extracted cli/wmux.js).
+  // copy ensureAppImageCliLink made at startup — never at ~/.local/bin, which may
+  // hold someone else's `wmux` — and only when that copy really exists.
   if (platform === 'linux' && env.APPIMAGE) {
-    return path.join(env.HOME || os.homedir(), '.local', 'bin');
+    const dir = getAppImageCliDir(env);
+    if (fs.existsSync(path.join(dir, 'wmux'))) return dir;
   }
   return getCliBinPath();
 }

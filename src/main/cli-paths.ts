@@ -11,6 +11,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+/** Stable home of the AppImage's CLI copy (holds wmux.js and a `wmux` link to it). */
+export function getAppImageCliDir(env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.HOME || os.homedir();
+  return path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'wmux', 'cli');
+}
+
 /**
  * Linux AppImage only: copy the bundled CLI out of the per-launch /tmp/.mount_*
  * dir to ~/.local/share/wmux/cli and link ~/.local/bin/wmux to it, so the path
@@ -28,12 +34,14 @@ export function ensureAppImageCliLink(
   const home = env.HOME || os.homedir();
   const src = path.join(resourcesPath, 'cli');
   if (!fs.existsSync(path.join(src, 'wmux.js'))) return undefined;
-  const dest = path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'wmux', 'cli');
+  const dest = getAppImageCliDir(env);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.cpSync(src, dest, { recursive: true });
   const cli = path.join(dest, 'wmux.js');
   fs.chmodSync(cli, 0o755);
+  // `<dir>/wmux` is what the agent block calls, so the copy dir works without the PATH link.
+  fs.symlinkSync('wmux.js', path.join(dest, 'wmux'));
   const bin = path.join(home, '.local', 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const link = path.join(bin, 'wmux');
