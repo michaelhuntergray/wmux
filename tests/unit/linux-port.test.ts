@@ -46,6 +46,18 @@ describe('AppImage CLI link', () => {
   };
   const env = () => ({ APPIMAGE: '/x/wmux.AppImage', HOME: home });
 
+  it('links to a file that runs on its own: the packaged cli/wmux.js has a node shebang', () => {
+    // The links exec wmux.js directly, so the shipped file must carry the shebang
+    // (tsc keeps a leading #! line). Check both the source and the packaging map.
+    const root = path.join(__dirname, '..', '..');
+    expect(fs.readFileSync(path.join(root, 'src', 'cli', 'wmux.ts'), 'utf-8')).toMatch(/^#!\/usr\/bin\/env node\r?\n/);
+    const builder = JSON.parse(fs.readFileSync(path.join(root, 'electron-builder.json'), 'utf-8'));
+    const res = JSON.stringify(builder);
+    expect(res).toContain('"from":"dist/cli/wmux.js","to":"cli/wmux.js"');
+    const built = path.join(root, 'dist', 'cli', 'wmux.js');
+    if (fs.existsSync(built)) expect(fs.readFileSync(built, 'utf-8').startsWith('#!/usr/bin/env node')).toBe(true);
+  });
+
   it('does nothing off an AppImage', () => {
     const res = setup();
     expect(ensureAppImageCliLink('linux', { HOME: home }, res)).toBeUndefined();
