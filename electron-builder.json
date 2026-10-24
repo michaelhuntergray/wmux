@@ -58,6 +58,7 @@
     { "from": "resources/themes", "to": "themes" },
     { "from": "resources/sounds", "to": "sounds" },
     { "from": "resources/claude-instructions.md", "to": "claude-instructions/claude-instructions.md" },
+    { "from": "resources/claude-pointer.md", "to": "claude-instructions/claude-pointer.md" },
     { "from": "src/shell-integration", "to": "shell-integration" },
     { "from": "dist/cli/wmux.js", "to": "cli/wmux.js" },
     { "from": "dist/cli/wmux-hook.js", "to": "cli/wmux-hook.js" },

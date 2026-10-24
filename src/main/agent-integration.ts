@@ -107,9 +107,10 @@ export const DEFAULT_CONSENT: IntegrationConsent = { decision: 'unset', features
 export const INTEGRATION_CONSENT_DETAIL =
   'wmux can teach your coding agents to drive its browser panel, markdown views ' +
   'and sidebar status. Doing so edits files in your home directory:\n\n' +
-  '  • ~/.claude/CLAUDE.md, ~/.config/opencode/AGENTS.md, ~/.omp/agent/AGENTS.md\n' +
+  '  • ~/.claude/CLAUDE.md, ~/.claude/skills/wmux/SKILL.md,\n' +
+  '    ~/.config/opencode/AGENTS.md, ~/.omp/agent/AGENTS.md\n' +
   '    and ~/.pi/agent/AGENTS.md\n' +
-  '      a wmux section, between markers, leaving your own text untouched\n' +
+  '      a wmux section between markers (and a managed Claude skill), leaving your own text untouched\n' +
   '  • ~/.kiro/steering/wmux.md\n' +
   '      a steering file of wmux\'s own; your other Kiro steering is untouched\n' +
   '  • ~/.grok/rules/wmux.md and ~/.grok/hooks/wmux.json (only if Grok is installed)\n' +
