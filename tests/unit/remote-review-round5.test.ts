@@ -230,6 +230,7 @@ describe('CLAUDE.md (#254, review round 5)', () => {
     const md = read('CLAUDE.md');
     expect(md).not.toContain('already at ~1.8 MB');
     expect(md).toContain('remote-manifest.json (the console server refuses to serve without it)');
-    expect(md).toMatch(/separate shared chunk that the desktop window loads too/);
+    // MIC-34 moved the build architecture paragraph verbatim into docs/dev/architecture.md.
+    expect(read('docs/dev/architecture.md')).toMatch(/separate shared chunk that the desktop window loads too/);
   });
 });

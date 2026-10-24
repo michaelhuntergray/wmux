@@ -220,7 +220,12 @@ export function ensureClaudeContext(): void {
 
     const before = existing.substring(0, startIdx);
     const after = existing.substring(endIdx + END_MARKER.length);
-    fs.writeFileSync(claudeMdPath, before + wmuxBlock + after, 'utf-8');
+    // trimEnd: the tail already supplies the newline. Keeping the block's own
+    // leaves three newlines, which stripLegacyBlocks collapses on the next launch,
+    // so every launch rewrote the file (see injectWmuxBlock).
+    const next = before + wmuxBlock.trimEnd() + after;
+    if (next === raw) return;
+    fs.writeFileSync(claudeMdPath, next, 'utf-8');
     console.log('[wmux] Updated wmux context in ~/.claude/CLAUDE.md');
   } catch (err) {
     console.warn('[wmux] Failed to update Claude context:', err);
