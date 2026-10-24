@@ -197,9 +197,9 @@ describe('Settings (#254)', () => {
   });
 
   it('CLAUDE.md lists the dismiss-rejected-origin bridge', () => {
-    const doc = read('CLAUDE.md');
-    expect(doc).toMatch(/remoteConsole:[^\n]*\n[^\n]*dismissRejectedOrigin/);
-    expect(doc).toContain('rename-device/dismiss-rejected-origin');
+    // MIC-34 moved these lists verbatim from CLAUDE.md into docs/dev/.
+    expect(read('docs/dev/architecture.md')).toMatch(/remoteConsole:[^\n]*\n[^\n]*dismissRejectedOrigin/);
+    expect(read('docs/dev/ipc-and-shell-integration.md')).toContain('rename-device/dismiss-rejected-origin');
   });
 });
 

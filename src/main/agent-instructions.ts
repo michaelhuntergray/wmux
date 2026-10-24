@@ -1,12 +1,9 @@
 /**
- * The wmux block that gets spliced into every agent's global context file.
+ * Resource lookup and rendering for wmux's agent context blocks.
  *
- * One source (`resources/claude-instructions.md`), read by three writers —
- * claude-context.ts, opencode-context.ts and kiro-context.ts — each of which
- * used to carry its own copy of the path lookup. It is centralised here because
- * the block is no longer a static file: it carries one interpolated fact, and a
- * fact interpolated in two of three places is worse than one interpolated
- * nowhere.
+ * The full resource stays shared by the non-Claude writers and Claude's skill.
+ * Claude's global context gets a separate pointer resource. Both use the same
+ * install-specific CLI path substitution.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -100,16 +97,30 @@ export function injectWmuxBlock(rawExisting: string, wmuxBlock: string, stripLeg
 }
 
 export function getInstructionsPath(): string {
+  return getInstructionResourcePath('claude-instructions.md');
+}
+
+function getInstructionResourcePath(name: string): string {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { app } = require('electron') as typeof import('electron');
     if (app.isPackaged) {
-      return path.join(process.resourcesPath, 'claude-instructions', 'claude-instructions.md');
+      return path.join(process.resourcesPath, 'claude-instructions', name);
     }
   } catch {
     // Not in Electron
   }
-  return path.join(__dirname, '../../resources/claude-instructions.md');
+  return path.join(__dirname, '../../resources', name);
+}
+
+/** Claude's short global pointer shares the full block's install-specific CLI path. */
+export function readRenderedClaudePointer(): string | null {
+  const pointerPath = getInstructionResourcePath('claude-pointer.md');
+  if (!fs.existsSync(pointerPath)) {
+    console.warn('[wmux] claude-pointer.md not found at', pointerPath);
+    return null;
+  }
+  return renderInstructions(fs.readFileSync(pointerPath, 'utf-8'));
 }
 
 /**

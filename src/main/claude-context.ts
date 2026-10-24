@@ -1,10 +1,48 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { readRenderedInstructions } from './agent-instructions';
+import { readRenderedClaudePointer, readRenderedInstructions } from './agent-instructions';
 
 const START_MARKER = '<!-- wmux:start';
 const END_MARKER = '<!-- wmux:end -->';
+const SKILL_MANAGED_LINE = '<!-- AUTO-MANAGED BY wmux. Edits are overwritten on launch. -->';
+
+function getWmuxSkillPath(): string {
+  return path.join(os.homedir(), '.claude', 'skills', 'wmux', 'SKILL.md');
+}
+
+function ensureWmuxSkill(renderedBlock: string): void {
+  const skillPath = getWmuxSkillPath();
+  const body = renderedBlock.split(/\r?\n/).filter((line) => !line.startsWith(START_MARKER) && line !== END_MARKER).join('\n').trim();
+  const content = [
+    '---',
+    'name: wmux',
+    'description: Use when `wmux ping` answers pong to drive the browser panel, markdown view, report-agent (Needs-you prompts), and report-subagent.',
+    '---',
+    SKILL_MANAGED_LINE,
+    '',
+    body,
+    '',
+  ].join('\n');
+  if (fs.existsSync(skillPath)) {
+    const current = fs.readFileSync(skillPath, 'utf-8');
+    if (!current.includes(SKILL_MANAGED_LINE)) {
+      console.warn('[wmux] Leaving user-owned ~/.claude/skills/wmux/SKILL.md untouched');
+      return;
+    }
+    if (current === content) return;
+  }
+  fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+  fs.writeFileSync(skillPath, content, 'utf-8');
+}
+
+function removeWmuxSkill(): void {
+  const skillPath = getWmuxSkillPath();
+  if (!fs.existsSync(skillPath)) return;
+  if (!fs.readFileSync(skillPath, 'utf-8').includes(SKILL_MANAGED_LINE)) return;
+  fs.unlinkSync(skillPath);
+  if (fs.readdirSync(path.dirname(skillPath)).length === 0) fs.rmdirSync(path.dirname(skillPath));
+}
 
 
 export function getClaudeMdPath(): string {
@@ -115,7 +153,8 @@ function collapse(text: string): string {
 }
 
 /**
- * Ensures the user's global ~/.claude/CLAUDE.md contains the wmux section.
+ * Ensures the user's global ~/.claude/CLAUDE.md contains the wmux pointer and
+ * ~/.claude/skills/wmux/SKILL.md contains the full rendered instructions.
  * - Creates ~/.claude/ and CLAUDE.md if they don't exist
  * - Inserts the wmux block if not present
  * - Updates the wmux block if it's outdated
@@ -127,8 +166,10 @@ export function ensureClaudeContext(): void {
     // Rendered rather than read: the block carries this install's absolute CLI
     // path, so a session that wmux did not spawn (and therefore has no `wmux`
     // on PATH) can still tell "not running" from "not reachable" — issue #158.
-    const wmuxBlock = readRenderedInstructions();
-    if (wmuxBlock === null) return;
+    const wmuxBlock = readRenderedClaudePointer();
+    const fullBlock = readRenderedInstructions();
+    if (wmuxBlock === null || fullBlock === null) return;
+    ensureWmuxSkill(fullBlock);
     const claudeMdPath = getClaudeMdPath();
     const claudeDir = path.dirname(claudeMdPath);
 
@@ -179,7 +220,12 @@ export function ensureClaudeContext(): void {
 
     const before = existing.substring(0, startIdx);
     const after = existing.substring(endIdx + END_MARKER.length);
-    fs.writeFileSync(claudeMdPath, before + wmuxBlock + after, 'utf-8');
+    // trimEnd: the tail already supplies the newline. Keeping the block's own
+    // leaves three newlines, which stripLegacyBlocks collapses on the next launch,
+    // so every launch rewrote the file (see injectWmuxBlock).
+    const next = before + wmuxBlock.trimEnd() + after;
+    if (next === raw) return;
+    fs.writeFileSync(claudeMdPath, next, 'utf-8');
     console.log('[wmux] Updated wmux context in ~/.claude/CLAUDE.md');
   } catch (err) {
     console.warn('[wmux] Failed to update Claude context:', err);
@@ -218,6 +264,7 @@ export function stripWmuxBlock(content: string): string | null {
  */
 export function removeClaudeContext(): void {
   try {
+    removeWmuxSkill();
     const claudeMdPath = getClaudeMdPath();
     if (!fs.existsSync(claudeMdPath)) return;
     const stripped = stripWmuxBlock(fs.readFileSync(claudeMdPath, 'utf-8'));
