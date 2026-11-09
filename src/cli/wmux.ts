@@ -260,7 +260,12 @@ function readPipeToken(): string {
   if (fromEnv) return fromEnv;
   try {
     const suffix = process.env.WMUX_INSTANCE?.trim() ? `-${process.env.WMUX_INSTANCE.trim()}` : '';
-    const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    // Same base as shared/instance.ts getAppDataDir(): off Windows the app keeps its
+    // data (and the token) under XDG_CONFIG_HOME, not AppData.
+    const base = process.env.APPDATA
+      || (process.platform === 'win32'
+        ? path.join(os.homedir(), 'AppData', 'Roaming')
+        : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     return fs.readFileSync(path.join(base, `wmux${suffix}`, 'pipe-token'), 'utf-8').trim();
   } catch {
     return '';
