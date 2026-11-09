@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { loadUserConfig, resetConfigWarnings } from '../../src/main/user-config';
 
 function writeTmp(contents: string): string {
@@ -142,6 +143,25 @@ describe('loadUserConfig', () => {
     const out = loadUserConfig(tmpPath);
     expect(out.remote).toEqual({ uploadOnPaste: false });
     expect(out.errors.some((e) => e.includes('remote.upload-on-drop'))).toBe(true);
+  });
+
+  // Issue #381 — the opt-out for downscaling a pasted image.
+  it('maps [paste] downscale-images', () => {
+    tmpPath = writeTmp(`
+      [paste]
+      downscale-images = false
+    `);
+    expect(loadUserConfig(tmpPath).paste).toEqual({ downscaleImages: false });
+  });
+
+  it('reports a non-boolean [paste] downscale-images', () => {
+    tmpPath = writeTmp(`
+      [paste]
+      downscale-images = "no"
+    `);
+    const bad = loadUserConfig(tmpPath);
+    expect(bad.paste).toBeUndefined();
+    expect(bad.errors.some((e) => e.includes('paste.downscale-images'))).toBe(true);
   });
 
   // Issue #146 — `[keys]` remaps: the config file is the plugin-shaped ask,
@@ -410,7 +430,7 @@ describe('[terminal] osc-title-tabs (issue #221)', () => {
   });
 
   function write(body: string): string {
-    const p = path.join(os.tmpdir(), `wmux-osc-title-${Date.now()}-${Math.random()}.toml`);
+    const p = path.join(os.tmpdir(), `wmux-osc-title-${Date.now()}-${randomUUID()}.toml`);
     fs.writeFileSync(p, body, 'utf8');
     return p;
   }
@@ -432,5 +452,144 @@ describe('[terminal] osc-title-tabs (issue #221)', () => {
     // section that says nothing about tabs must not turn the feature off.
     tmp = write('[terminal]\nfont-size = 14\n');
     expect(loadUserConfig(tmp).terminal?.oscTitleTabs).toBeUndefined();
+  });
+
+  it('reads osc-title-workspaces in both spellings, and leaves it undefined when absent', () => {
+    tmp = write('[terminal]\nosc-title-workspaces = false\n');
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.terminal?.oscTitleWorkspaces).toBe(false);
+    fs.unlinkSync(tmp);
+    tmp = write('[terminal]\noscTitleWorkspaces = true\n');
+    expect(loadUserConfig(tmp).terminal?.oscTitleWorkspaces).toBe(true);
+    fs.unlinkSync(tmp);
+    tmp = write('[terminal]\nosc-title-tabs = false\n');
+    expect(loadUserConfig(tmp).terminal?.oscTitleWorkspaces).toBeUndefined();
+  });
+});
+
+describe('[appearance] inactive-pane-dim', () => {
+  let tmp: string | null = null;
+  afterEach(() => {
+    if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    tmp = null;
+  });
+
+  function write(body: string): string {
+    const p = path.join(os.tmpdir(), `wmux-pane-dim-${Date.now()}-${randomUUID()}.toml`);
+    fs.writeFileSync(p, body, 'utf8');
+    return p;
+  }
+
+  it('reads 0 as "do not dim", not as absent', () => {
+    tmp = write('[appearance]\ninactive-pane-dim = 0\n');
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.appearance?.inactivePaneDim).toBe(0);
+  });
+
+  it('reads the camelCase spelling too', () => {
+    tmp = write('[appearance]\ninactivePaneDim = 35\n');
+    expect(loadUserConfig(tmp).appearance?.inactivePaneDim).toBe(35);
+  });
+
+  it('reads it alongside ui-theme', () => {
+    tmp = write('[appearance]\nui-theme = "light"\ninactive-pane-dim = 10\n');
+    const out = loadUserConfig(tmp);
+    expect(out.appearance).toEqual({ uiTheme: 'light', inactivePaneDim: 10 });
+  });
+
+  it('keeps a valid dim when ui-theme is invalid', () => {
+    // One bad key in the section must not take the good one down with it.
+    tmp = write('[appearance]\nui-theme = "purple"\ninactive-pane-dim = 0\n');
+    const out = loadUserConfig(tmp);
+    expect(out.appearance?.inactivePaneDim).toBe(0);
+    expect(out.errors.length).toBe(1);
+  });
+
+  it('rejects a value outside 0-60 with an error, leaving the store default', () => {
+    tmp = write('[appearance]\ninactive-pane-dim = 80\n');
+    const out = loadUserConfig(tmp);
+    expect(out.appearance?.inactivePaneDim).toBeUndefined();
+    expect(out.errors).toEqual(['appearance.inactive-pane-dim: 80 not between 0 and 60']);
+  });
+
+  it.each([['0.2', 20], ['0.5', 50]])('rejects the fraction %s as a mistaken 0..1 form', (raw, pct) => {
+    tmp = write(`[appearance]\ninactive-pane-dim = ${raw}\n`);
+    const out = loadUserConfig(tmp);
+    expect(out.appearance?.inactivePaneDim).toBeUndefined();
+    expect(out.errors).toEqual([
+      `appearance.inactive-pane-dim: ${raw} is a percent (0-60); for ${pct}% write ${pct}`,
+    ]);
+  });
+
+  it.each([
+    ['0.7', 'it is over the maximum'],
+    ['0.004', 'it rounds to 0'],
+  ])('rejects %s without a suggestion, because %s', (raw) => {
+    tmp = write(`[appearance]\ninactive-pane-dim = ${raw}\n`);
+    const out = loadUserConfig(tmp);
+    expect(out.appearance?.inactivePaneDim).toBeUndefined();
+    expect(out.errors).toEqual([`appearance.inactive-pane-dim: ${raw} is a percent (0-60)`]);
+  });
+
+  it.each([0, 1, 12.5, 20, 60])('accepts %s', (value) => {
+    tmp = write(`[appearance]\ninactive-pane-dim = ${value}\n`);
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.appearance?.inactivePaneDim).toBe(value);
+  });
+
+  it('leaves it undefined when absent', () => {
+    tmp = write('[appearance]\nui-theme = "dark"\n');
+    expect(loadUserConfig(tmp).appearance?.inactivePaneDim).toBeUndefined();
+  });
+});
+
+describe('[sidebar] wrap-titles', () => {
+  let tmp: string | null = null;
+  afterEach(() => {
+    if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    tmp = null;
+  });
+
+  function write(body: string): string {
+    const p = path.join(os.tmpdir(), `wmux-sidebar-${Date.now()}-${randomUUID()}.toml`);
+    fs.writeFileSync(p, body, 'utf8');
+    return p;
+  }
+
+  it('reads true', () => {
+    tmp = write('[sidebar]\nwrap-titles = true\n');
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.sidebar?.wrapTitles).toBe(true);
+  });
+
+  it('reads false as "turn it off", not as absent', () => {
+    tmp = write('[sidebar]\nwrap-titles = false\n');
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.sidebar).toEqual({ wrapTitles: false });
+  });
+
+  it('reads the camelCase spelling too', () => {
+    tmp = write('[sidebar]\nwrapTitles = true\n');
+    expect(loadUserConfig(tmp).sidebar?.wrapTitles).toBe(true);
+  });
+
+  it('leaves it undefined when the key or the section is absent', () => {
+    tmp = write('[appearance]\nui-theme = "dark"\n');
+    expect(loadUserConfig(tmp).sidebar).toBeUndefined();
+    fs.unlinkSync(tmp);
+    tmp = write('[sidebar]\n');
+    expect(loadUserConfig(tmp).sidebar).toBeUndefined();
+  });
+
+  it('rejects a non-boolean with an error, leaving the store default', () => {
+    tmp = write('[sidebar]\nwrap-titles = "yes"\n');
+    const out = loadUserConfig(tmp);
+    expect(out.sidebar).toBeUndefined();
+    expect(out.errors).toEqual(['sidebar.wrap-titles: expected boolean']);
   });
 });

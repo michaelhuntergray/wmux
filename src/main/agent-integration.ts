@@ -3,10 +3,11 @@
  *
  * wmux integrates with Claude Code, OpenCode, Kiro, omp, pi, Grok, agy and Qwen Code by editing files
  * in the user's home: it appends a block to ~/.claude/CLAUDE.md,
- * ~/.config/opencode/AGENTS.md, ~/.omp/agent/AGENTS.md and pi's user-scope
- * context file, writes ~/.kiro/steering/wmux.md, registers eight hook families
- * in ~/.claude/settings.json, installs a status extension into
- * ~/.pi/agent/extensions/, points chrome-devtools-mcp at its own CDP proxy, and
+ * ~/.config/opencode/AGENTS.md and ~/.omp/agent/AGENTS.md, writes
+ * ~/.kiro/steering/wmux.md, registers eight hook families in ~/.claude/settings.json
+ * (and in the same file inside each running WSL distro, #428),
+ * installs pi's scoped instructions and status extension into
+ * ~/.pi/agent/extensions/wmux/, points chrome-devtools-mcp at its own CDP proxy, and
  * installs an OpenCode orchestrator plugin.
  *
  * It also used to install a Claude Code plugin, which is deprecated and gone
@@ -28,6 +29,10 @@
  * `declined` is deliberately sticky and re-asserted on every launch: a user who
  * says no once should not have to say it again after an update, and should not
  * have to hand-delete the leftovers either.
+ *
+ * That makes this module the ONLY way in. None of the `*-context.ts` writers
+ * imported below (claude, opencode, kiro, omp, pi, grok, agy, qwen) may be
+ * called directly from startup any more — route it through here.
  */
 import {
   ensureClaudeContext,
@@ -53,7 +58,6 @@ import {
   removeGrokHooks,
 } from './grok-context';
 import {
-  ensurePiContext,
   ensurePiExtension,
   removePiContext,
   removePiExtension,
@@ -67,6 +71,7 @@ import {
   removeQwenHooks,
   removeQwenMcp,
 } from './qwen-context';
+import { setWslClaudeHooksWanted } from './wsl-claude-hooks';
 import { loadSettings, saveSetting } from './settings-store';
 
 export type IntegrationDecision = 'unset' | 'granted' | 'declined';
@@ -107,10 +112,8 @@ export const DEFAULT_CONSENT: IntegrationConsent = { decision: 'unset', features
 export const INTEGRATION_CONSENT_DETAIL =
   'wmux can teach your coding agents to drive its browser panel, markdown views ' +
   'and sidebar status. Doing so edits files in your home directory:\n\n' +
-  '  • ~/.claude/CLAUDE.md, ~/.claude/skills/wmux/SKILL.md,\n' +
-  '    ~/.config/opencode/AGENTS.md, ~/.omp/agent/AGENTS.md\n' +
-  '    and ~/.pi/agent/AGENTS.md\n' +
-  '      a wmux section between markers (and a managed Claude skill), leaving your own text untouched\n' +
+  '  • ~/.claude/CLAUDE.md, ~/.config/opencode/AGENTS.md, ~/.omp/agent/AGENTS.md\n' +
+  '      a wmux section, between markers, leaving your own text untouched\n' +
   '  • ~/.kiro/steering/wmux.md\n' +
   '      a steering file of wmux\'s own; your other Kiro steering is untouched\n' +
   '  • ~/.grok/rules/wmux.md and ~/.grok/hooks/wmux.json (only if Grok is installed)\n' +
@@ -122,8 +125,10 @@ export const INTEGRATION_CONSENT_DETAIL =
   '  • ~/.claude/settings.json\n' +
   '      eight hook families: PostToolUse, Notification, Stop, SubagentStop,\n' +
   '      SessionStart, UserPromptSubmit, PreToolUse and SessionEnd\n' +
-  '  • ~/.pi/agent/extensions/wmux.js\n' +
-  '      a pi extension that reports this pane\'s status to the sidebar\n' +
+  '  • ~/.claude/settings.json in each running WSL distro (only where Claude Code\n' +
+  '      has a settings file there) — the same hooks, for Claude Code in a WSL pane\n' +
+  '  • ~/.pi/agent/extensions/wmux/\n' +
+  '      scoped pi instructions and independently enabled sidebar reporting\n' +
   '  • ~/.omp/agent/extensions/wmux.js\n' +
   '      an omp extension that reports foreground and background job state\n' +
   '  • ~/.gemini/config/plugins/wmux/ (only if the Antigravity CLI is installed)\n' +
@@ -179,24 +184,28 @@ function applyFeature(feature: IntegrationFeature, enabled: boolean): void {
         // Grok after Claude: it writes its rules file only when Grok would not
         // already read the block ensureClaudeContext just put in CLAUDE.md.
         ensureClaudeContext(); ensureOpencodeContext(); ensureKiroContext();
-        ensureOmpContext(); ensurePiContext(); ensureGrokContext(); ensureQwenContext();
+        ensureOmpContext(); ensureGrokContext(); ensureQwenContext();
       } else {
         removeClaudeContext(); removeOpencodeContext(); removeKiroContext();
-        removeOmpContext(); removePiContext(); removeGrokContext(); removeQwenContext();
+        removeOmpContext(); removeGrokContext(); removeQwenContext();
       }
       break;
     case 'hooks':
-      // The pi extension belongs here and not under `orchestrator` because the
-      // panel's own label for this toggle is "Status hooks", and that is
-      // precisely what it is: a per-event reporter, no orchestration. The
-      // OpenCode plugin does the same job from under `orchestrator`, which is a
-      // pre-existing mismatch deliberately left alone — moving it would
+      // Which FEATURE a new integration hangs off is a real decision, not a
+      // slot. Pi is reconciled after both its instruction and hook flags are known.
+      // The OpenCode plugin reports status from under `orchestrator`, which
+      // is a pre-existing mismatch deliberately left alone — moving it would
       // silently re-enable a status bridge for every user who switched that
       // toggle off, which is the #132 complaint in reverse.
       // The agy plugin likewise: it reports which conversation a pane holds,
       // the same job Claude's SessionStart hook does from this toggle.
-      if (enabled) { ensureClaudeHooks(); ensurePiExtension(); ensureOmpExtension(); ensureGrokHooks(); ensureAgyPlugin(); ensureQwenHooks(); }
-      else { removeClaudeHooks(); removePiExtension(); removeOmpExtension(); removeGrokHooks(); removeAgyPlugin(); removeQwenHooks(); }
+      if (enabled) { ensureClaudeHooks(); ensureOmpExtension(); ensureGrokHooks(); ensureAgyPlugin(); ensureQwenHooks(); }
+      else { removeClaudeHooks(); removeOmpExtension(); removeGrokHooks(); removeAgyPlugin(); removeQwenHooks(); }
+      // Claude Code inside WSL distros (#428): the same hooks in each RUNNING
+      // distro's ~/.claude/settings.json, in both directions. Asynchronous, and
+      // it never wakes a stopped distro, so a stopped one is reconciled when it
+      // is next seen running (wsl-claude-hooks.ts).
+      setWslClaudeHooksWanted(enabled);
       break;
     case 'orchestrator':
       // The Claude Code half of this feature is DEPRECATED (issue #239) and has
@@ -235,6 +244,12 @@ export function applyConsent(consent: IntegrationConsent): void {
   for (const feature of INTEGRATION_FEATURES) {
     applyFeature(feature, granted && consent.features[feature]);
   }
+  if (granted && (consent.features.instructions || consent.features.hooks)) {
+    ensurePiExtension({ instructions: consent.features.instructions, hooks: consent.features.hooks });
+  } else {
+    removePiExtension();
+  }
+  removePiContext();
 }
 
 /**

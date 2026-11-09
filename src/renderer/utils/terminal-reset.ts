@@ -48,9 +48,35 @@
  * DECSC clobbers whatever the shell had saved in that slot. That is a real but
  * cheap cost: shells re-save around every prompt, and a pane the user has asked
  * to force-reset has already lost more than one cursor bookmark.
+ *
+ * ## The alternate screen is not a mode a live program re-asserts (#347)
+ *
+ * Most of the modes above are cheap to drop under a running program: it puts
+ * back the ones it wants on its next redraw, or the user notices and restarts
+ * it. `?1049` is different. A fullscreen program (Claude Code, opencode, vim)
+ * sends `?1049h` once, at startup, and never again — so a manual reset that
+ * left the alternate buffer under it sent every later frame into the shell's
+ * scrollback, and its exit `?1049l` found no alternate screen to leave and only
+ * homed the cursor, printing the prompt over the stale frame. The PTY-exit path
+ * always leaves (there is no program); the manual reset leaves only when the
+ * shell has positively said it is back at its prompt. An UNKNOWN state keeps the
+ * alternate screen: a program started before the shell's first prompt (a
+ * restored `claude --resume`, run by the PowerShell integration during init)
+ * has never been announced as running, and is exactly the case to protect.
+ *
+ * ## Most panes never report a shell state (#357)
+ *
+ * Only wmux's PowerShell integration reports one, so that rule alone left cmd,
+ * Git Bash, WSL, SSH and nested shells with no way out of a dead program's
+ * alternate screen. The decision now reads the pane's own output first (see
+ * ./alt-screen-owner): an OSC 133;A drawn on the alternate screen means a shell
+ * is prompting there. Where nothing emits prompt marks, a second reset within
+ * {@link FORCE_LEAVE_WINDOW_MS} forces it, and the first one says so.
  */
 
 import type { Terminal } from '@xterm/xterm';
+import type { ShellState } from './surface-shell-state';
+import type { AlternateScreenOwner } from './alt-screen-owner';
 
 /**
  * Mode resets that are safe to send in any state, in the order they are sent.
@@ -100,15 +126,78 @@ export function terminalResetSequence(onAlternateBuffer: boolean): string {
 }
 
 /**
+ * Does the shell-state report alone say the alternate screen is abandoned? Only
+ * when the pane's shell has reported it is back at its prompt — then whatever
+ * entered the alternate screen is gone (#175). `running` means it is still
+ * drawing there, and no report at all means wmux cannot tell (#347), so both
+ * keep it. The fallback of {@link alternateScreenResetAction}, used when the
+ * pane's own output said nothing (#357).
+ */
+export function shellOwnsScreen(shellState: ShellState | undefined): boolean {
+  return shellState === 'idle' || shellState === 'interrupted';
+}
+
+/** How long after a reset that kept the alternate screen a second one forces it (#357). */
+export const FORCE_LEAVE_WINDOW_MS = 5000;
+
+/**
+ * What a manual reset does about the alternate screen: nothing (the pane is not
+ * on it), leave it because the evidence says nothing is drawing there, leave it
+ * because the user insisted, or keep it.
+ */
+export type AlternateScreenResetAction = 'none' | 'leave' | 'force' | 'keep';
+
+export interface AlternateScreenFacts {
+  onAlternateBuffer: boolean;
+  /** Who the pane's own output says is on the alternate screen, if anything said. */
+  owner: AlternateScreenOwner | undefined;
+  shellState: ShellState | undefined;
+  /** When this surface's previous reset kept the alternate screen, if one did. */
+  lastKeptAt: number | undefined;
+  now: number;
+  /** The palette's "leave alternate screen" entry: the user has already insisted. */
+  forceRequested: boolean;
+}
+
+/**
+ * The manual reset's decision about the alternate screen (#357).
+ *
+ * The pane's own output outranks the shell-state report, because it is in-band
+ * and works in every shell: a prompt drawn on the alternate screen since it was
+ * last entered means the program that entered it is gone, even when the outer
+ * shell last reported `running` for the `ssh` or `wsl` it is still inside; a
+ * program entering it since the last such prompt, or a command started from
+ * that prompt (OSC 133;C) and not yet finished, means something may still be
+ * drawing there, even when PowerShell without PSReadLine reports `idle`. The
+ * #347 shell-state rule decides only when the stream said neither. A pane with
+ * no prompt marks at all can still be recovered by asking twice.
+ */
+export function alternateScreenResetAction(facts: AlternateScreenFacts): AlternateScreenResetAction {
+  if (!facts.onAlternateBuffer) return 'none';
+  if (facts.forceRequested) return 'force';
+  if (facts.owner === 'shell') return 'leave';
+  if (facts.owner === undefined && shellOwnsScreen(facts.shellState)) return 'leave';
+  const sinceKept = facts.lastKeptAt === undefined ? -1 : facts.now - facts.lastKeptAt;
+  return sinceKept >= 0 && sinceKept <= FORCE_LEAVE_WINDOW_MS ? 'force' : 'keep';
+}
+
+export interface ResetOptions {
+  /**
+   * Stay on the alternate buffer even if the terminal is on it, because a
+   * program may still be drawing there (#347). Every other mode is still reset.
+   */
+  keepAlternateScreen?: boolean;
+}
+
+/**
  * Put `terminal` back into a usable state.
  *
  * Writes into the terminal, never to the PTY — this changes what wmux's own
  * emulator believes, and must not be visible to whatever is still running on
- * the other end. A live application's next redraw simply re-asserts the modes
- * it wants, which is the correct outcome: reset while `vim` is up and `vim`
- * repaints.
+ * the other end. A live application's next redraw re-asserts most of the modes
+ * it wants; the alternate screen is the exception, see `keepAlternateScreen`.
  */
-export function resetTerminalModes(terminal: Terminal): void {
+export function resetTerminalModes(terminal: Terminal, options: ResetOptions = {}): void {
   let onAlternateBuffer = false;
   try {
     onAlternateBuffer = terminal.buffer.active.type === 'alternate';
@@ -118,7 +207,7 @@ export function resetTerminalModes(terminal: Terminal): void {
     // branch rather than a degraded one.
   }
   try {
-    terminal.write(terminalResetSequence(onAlternateBuffer));
+    terminal.write(terminalResetSequence(onAlternateBuffer && !options.keepAlternateScreen));
   } catch {
     // A disposed terminal throws on write. Recovery of a pane that no longer
     // exists is a no-op by definition, not an error worth surfacing.

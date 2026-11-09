@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import type { PromptEntry, PromptSource } from '../store/prompt-slice';
 import { nextPromptSeq, normalizePromptText } from '../store/prompt-slice';
 import { parsePromptMark } from './osc133';
+import { noteCommandEnd, noteCommandStart, notePromptStart } from './alt-screen-owner';
 import * as anchor from './prompt-anchor';
 import * as marks from './prompt-marks';
 
@@ -12,7 +13,9 @@ import * as marks from './prompt-marks';
  * Two sources feed it and neither knows about the other:
  *
  *   • `recordAgentPrompt` — Claude Code's UserPromptSubmit hook, arriving via
- *     App.tsx. Carries the text verbatim.
+ *     App.tsx. Carries the text verbatim. The OpenCode plugin's v2 prompt-admission
+ *     hook (#304) and its TUI half's `session.inbox.enqueued` (remote and shared
+ *     servers, #310) reach the same App.tsx handler through `wmux hook --prompt`.
  *   • `handlePromptMark` — OSC 133 from wmux's shell integration, arriving via
  *     the xterm parser in useTerminal. Carries a boundary; the text is read back
  *     out of the buffer.
@@ -48,6 +51,18 @@ const lastAgentPrompt = new Map<string, { text: string; at: number }>();
 function promptPrefs() {
   return useStore.getState().promptPrefs;
 }
+
+/**
+ * Pending refine retries, keyed by entry id.
+ *
+ * A retry is about resolving the LINE, not about the tint: an anchor-only setup
+ * needs the echo located just as much as a highlighted one, and the line can
+ * settle while the highlight stays off. The budget is bounded so a TUI that
+ * never paints a recognisable echo leaves the ruler tick rather than a timer.
+ */
+const tintRetries = new Map<string, ReturnType<typeof setInterval>>();
+const TINT_RETRY_MS = 150;
+const TINT_RETRY_BUDGET_MS = 5_000;
 
 /**
  * Commit an entry: register the mark, tell the store, then let the enabled
@@ -119,18 +134,27 @@ function highlightOptionsFor(entry: PromptEntry) {
     ruler: prefs.ruler,
     needle: marks.buildNeedle(entry.text),
     confirmed: entry.source !== 'agent',
+    text: entry.source === 'agent' ? entry.text : undefined,
   };
 }
 
 /** Highlight + anchor an entry according to the current preferences. */
-function applyViews(terminal: Terminal, entry: PromptEntry): void {
+function applyViews(terminal: Terminal, entry: PromptEntry): boolean {
   const prefs = promptPrefs();
+  let settled = entry.source !== 'agent';
   if (prefs.highlight) {
-    marks.applyHighlight(terminal, entry.surfaceId, entry.id, highlightOptionsFor(entry));
+    settled = marks.applyHighlight(terminal, entry.surfaceId, entry.id, highlightOptionsFor(entry)).settled;
+  } else if (entry.source === 'agent' && entry.text) {
+    settled = marks.promptAboveLive(terminal, entry.surfaceId, entry.id, entry.text);
   }
   // Anchoring is deliberately last and deliberately conditional on a resolved
   // line: an anchor is the one view that changes what the terminal DOES rather
   // than how it looks, so it must never engage on a guess.
+  //
+  // An AGENT line is only settled once the echo is entirely above the live input
+  // region. The composer holds the prompt text too, so a marker there would
+  // satisfy the text check and anchor the view to the composer while the answer
+  // streams past underneath — the same mistake the tint now refuses to make.
   //
   // The anchor is given a RESOLVER, not the line — `entry.line` is a snapshot
   // and the row moves once the scrollback starts trimming. The marker is the
@@ -140,9 +164,68 @@ function applyViews(terminal: Terminal, entry: PromptEntry): void {
   // is not the problem issue #207 describes, and holding `npm run build` back
   // from streaming would read as a freeze rather than as a feature.
   const inScope = prefs.anchorScope === 'all' || entry.source === 'agent';
-  if (prefs.anchor && inScope && entry.line !== null) {
+  // Only the newest prompt may own the anchor. A retry for an older prompt can
+  // settle seconds after the user has asked the next question; letting it
+  // re-anchor would yank the view back to the previous turn.
+  const latest = useStore.getState().prompts[entry.surfaceId]?.at(-1)?.id === entry.id;
+  if (prefs.anchor && inScope && settled && latest && entry.line !== null) {
     anchor.anchorAt(terminal, entry.surfaceId, marks.lineResolver(entry.surfaceId, entry.id));
   }
+  return settled;
+}
+
+/** Cancel one entry's pending retry, if any. */
+function cancelTintRetry(entryId: string): void {
+  const timer = tintRetries.get(entryId);
+  if (timer === undefined) return;
+  clearInterval(timer);
+  tintRetries.delete(entryId);
+}
+
+/**
+ * Re-run the refine while an agent TUI paints the echo above its composer.
+ *
+ * The first refine happens the moment the hook arrives, when the composer still
+ * shows the text; a nearest-match search therefore stays on the live row. This
+ * searches only above that row, so it cannot resolve back to the composer, and
+ * it stops as soon as the band is actually on the text. The budget is bounded:
+ * a TUI that never echoes the prompt (or echoes it unrecognizably) keeps the
+ * ruler tick rather than a timer forever.
+ */
+function scheduleTintRetry(
+  terminal: Terminal,
+  surfaceId: string,
+  entryId: string,
+  text: string,
+): void {
+  cancelTintRetry(entryId);
+  const started = Date.now();
+  const timer = setInterval(() => {
+    if (Date.now() - started >= TINT_RETRY_BUDGET_MS) {
+      cancelTintRetry(entryId);
+      return;
+    }
+    const moved = marks.refineMarkAbove(
+      terminal,
+      surfaceId,
+      entryId,
+      text,
+      marks.liveLine(terminal),
+    );
+    if (moved === null) return;
+    const store = useStore.getState();
+    const entry = store.prompts[surfaceId]?.find((candidate) => candidate.id === entryId);
+    if (!entry) {
+      cancelTintRetry(entryId);
+      return;
+    }
+    // `updatePrompt` always replaces the array; skip it when the marker is
+    // already on the row so a retry that is waiting on the anchor does not
+    // re-render every prompt consumer four times a second.
+    if (entry.line !== moved) store.updatePrompt(surfaceId, entryId, { line: moved });
+    if (applyViews(terminal, { ...entry, line: moved })) cancelTintRetry(entryId);
+  }, TINT_RETRY_MS);
+  tintRetries.set(entryId, timer);
 }
 
 /**
@@ -200,7 +283,17 @@ export function recordAgentPrompt(
       useStore.getState().updatePrompt(surfaceId, entry.id, { line: refined });
     }
   }
-  applyViews(terminal, entry);
+  const settled = applyViews(terminal, entry);
+
+  // The composer still holds the prompt when the hook lands, so the refine
+  // above can legitimately resolve to a row that is still the live input. Wait
+  // — on a timer, not on a repaint — for the TUI to paint the echo entirely
+  // above the cursor. Retry for the anchor too: a line that never settles is a
+  // wrong anchor even when the tint is switched off.
+  const prefs = promptPrefs();
+  if (!settled && (prefs.highlight || prefs.anchor) && marks.buildNeedle(clean)) {
+    scheduleTintRetry(terminal, surfaceId, entry.id, clean);
+  }
 }
 
 /**
@@ -236,6 +329,10 @@ export function handlePromptMark(terminal: Terminal, surfaceId: string, data: st
   switch (mark.kind) {
     case 'prompt-start':
       shellState.set(surfaceId, { promptLine: buf.baseY + buf.cursorY, inputLine: null, inputCol: 0 });
+      // A prompt on the alternate screen is also what tells Reset terminal
+      // state that the program which entered it is gone (#357). Reported from
+      // here so the mark is parsed once, and regardless of the prompt prefs.
+      notePromptStart(surfaceId, buf.type);
       return true;
     case 'input-start': {
       const state = shellState.get(surfaceId);
@@ -245,6 +342,9 @@ export function handlePromptMark(terminal: Terminal, surfaceId: string, data: st
       return true;
     }
     case 'output-start':
+      // A command run from a prompt on the alternate screen may draw there
+      // without entering it (#357).
+      noteCommandStart(surfaceId, buf.type);
       commitShellPrompt(terminal, surfaceId);
       return true;
     case 'command-end':
@@ -253,6 +353,7 @@ export function handlePromptMark(terminal: Terminal, surfaceId: string, data: st
       // maintained by every view. The parse still has to happen so the mark is
       // consumed rather than falling through to another OSC 133 consumer.
       shellState.delete(surfaceId);
+      noteCommandEnd(surfaceId, buf.type);
       return true;
     default:
       return false;
@@ -331,6 +432,9 @@ function commitShellPrompt(terminal: Terminal, surfaceId: string): void {
  * owns, which is exactly when a band's row is most likely to stop carrying its
  * prompt — re-applying re-runs that check on every entry at once instead of
  * waiting for each row to be scrolled back into view.
+ *
+ * The marker itself needs none of this: xterm 6 reflows it with its content
+ * (verified: narrowing 80→40 moved `marker.line` 20→40, still on the same text).
  */
 export function refreshHighlights(terminal: Terminal, surfaceId: string): void {
   const prefs = promptPrefs();
@@ -352,6 +456,53 @@ export function refreshHighlights(terminal: Terminal, surfaceId: string): void {
 export function forgetSurface(surfaceId: string): void {
   shellState.delete(surfaceId);
   lastAgentPrompt.delete(surfaceId);
+  for (const key of Array.from(tintRetries.keys())) {
+    if (key.startsWith(`${surfaceId}:`)) cancelTintRetry(key);
+  }
+  marks.forgetSurface(surfaceId);
+  anchor.forgetSurface(surfaceId);
+}
+
+/** A kept absolute line, re-based so that row `kept` becomes line 0; null when it is gone. */
+function rebaseLine(line: number | null, kept: number): number | null {
+  if (line === null || line < kept) return null;
+  return line - kept;
+}
+
+/** Move a pending prompt's marks onto the coordinates `clear()` leaves behind. */
+function rebaseShellState(surfaceId: string, kept: number): void {
+  const state = shellState.get(surfaceId);
+  if (!state) return;
+  const inputLine = rebaseLine(state.inputLine, kept);
+  if (state.inputLine !== null && inputLine === null) {
+    shellState.delete(surfaceId);
+    return;
+  }
+  state.promptLine = rebaseLine(state.promptLine, kept);
+  state.inputLine = inputLine;
+}
+
+/**
+ * Prepare a surface for xterm's `clear()` (Clear terminal buffer, #434). Call it
+ * BEFORE the clear, while the buffer still has the coordinates it describes.
+ *
+ * `clear()` keeps exactly one row, the cursor's, and makes it line 0. The marks
+ * and the anchor are tied to rows that are about to vanish, so they go, exactly
+ * as in `forgetSurface`. A prompt in progress is different: the shell already
+ * sent `133;A` and `133;B` for the prompt still on screen and will not send them
+ * again before the user presses Enter, so deleting that state would drop the
+ * next command from the log. It is re-based instead, onto the row that survives.
+ * A mark that was on a row above the cursor (a two-line prompt, input that has
+ * wrapped) points at text that is gone: the prompt line falls back to the input
+ * line, and input whose start is gone cannot be read back, so that prompt alone
+ * is given up.
+ */
+export function rebaseForClear(terminal: Terminal, surfaceId: string): void {
+  const buf = terminal.buffer.active;
+  rebaseShellState(surfaceId, buf.baseY + buf.cursorY);
+  for (const key of Array.from(tintRetries.keys())) {
+    if (key.startsWith(`${surfaceId}:`)) cancelTintRetry(key);
+  }
   marks.forgetSurface(surfaceId);
   anchor.forgetSurface(surfaceId);
 }
@@ -360,4 +511,5 @@ export function forgetSurface(surfaceId: string): void {
 export function __resetPromptLog(): void {
   shellState.clear();
   lastAgentPrompt.clear();
+  for (const key of Array.from(tintRetries.keys())) cancelTintRetry(key);
 }

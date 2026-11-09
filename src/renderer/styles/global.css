@@ -7,11 +7,30 @@
 html, body, #root {
   height: 100%;
   overflow: hidden;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--ui-font);
   background: var(--ui-bg-1);
   color: var(--ui-text-primary);
   user-select: none;
   -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea {
+  font-family: inherit;
+}
+
+button:focus-visible, [role='tab']:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: -2px;
+}
+
+.workspace-stage > [data-workspace-id] {
+  padding: var(--ui-workspace-inset);
+}
+
+/* Paint only the new perimeter, never a second translucent layer under PTYs. */
+html.wmux-transparent .workspace-stage > [data-workspace-id] {
+  padding: 0;
+  border: var(--ui-workspace-inset) solid var(--wmux-pane-gutter, var(--ui-bg-2));
 }
 
 /* Window transparency. A Win11 backdrop material only shows through where
@@ -53,7 +72,6 @@ html.wmux-transparent #root {
   margin: 8px;
   padding: 10px 12px;
   border: 1px solid var(--ui-border-strong);
-  border-left: 3px solid #b3261e;
   border-radius: 6px;
   background: var(--ui-bg-1);
   color: var(--ui-text-primary);
@@ -254,6 +272,32 @@ html.wmux-transparent #root {
   outline-offset: 0;
 }
 
+/* Layout preset naming dialog (#329). Above the Settings overlay (z-index 5000),
+   since Settings → Workspace is one of the places that opens it. */
+.save-layout-dialog__overlay {
+  z-index: 6000;
+}
+
+/* Its name field: the startup-command field, one line. */
+.save-layout-dialog__input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 320px;
+  margin: 0 0 14px;
+  padding: 6px 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: 5px;
+  background: var(--ui-bg-0);
+  color: var(--ui-text-primary);
+  font-size: 13px;
+}
+
+.save-layout-dialog__input:focus {
+  outline: 1px solid var(--ui-accent);
+  outline-offset: 0;
+}
+
 .confirm-dialog__btn--primary {
   border-color: var(--ui-accent);
   background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
@@ -261,4 +305,46 @@ html.wmux-transparent #root {
 
 .confirm-dialog__btn--primary:hover {
   background: color-mix(in srgb, var(--ui-accent) 35%, transparent);
+}
+
+/* Worktree workspace creation modal (#366). Reuses .confirm-dialog frame. */
+.worktree-modal__input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 320px;
+  margin: 0 0 14px;
+  padding: 6px 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: 5px;
+  background: var(--ui-bg-0);
+  color: var(--ui-text-primary);
+  font-size: 13px;
+}
+
+.worktree-modal__input:focus {
+  outline: 1px solid var(--ui-accent);
+  outline-offset: 0;
+}
+
+.worktree-modal__input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.worktree-modal__error {
+  color: #b3261e;
+  font-size: 12px;
+  margin: -8px 0 12px;
+}
+
+.worktree-modal__warning {
+  color: #b3261e;
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+
+/* Worktree close dialog (#366): what Discard destroys, spelled out. */
+.confirm-dialog__message--warning {
+  color: #e5534b;
 }

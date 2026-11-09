@@ -32,7 +32,6 @@ export interface StatusTextInputs {
   workingSessions: number;
   blockedSessions: number;
   currentToolLabel: string | null;
-  claudeIsIdle: boolean;
   shellState?: string;
   notificationText?: string;
 }
@@ -72,16 +71,20 @@ export interface MergedAgentSignals {
  * So each roster count joins the existing signal it is evidence for, and the
  * priority chain below is left exactly as it was. `unknown` contributes to no
  * count and therefore changes nothing — absence of a claim is not a claim.
+ *
+ * workspace-status.test.ts pins that as a PARITY: a silent agent renders exactly
+ * as no agent does. Anything a silent agent changes, it changed by overriding a
+ * finer signal it knows nothing about.
  */
 export function mergedAgentSignals(s: StatusTextInputs): MergedAgentSignals {
   const counts = s.agentCounts;
   return {
     blocked: Math.max(s.blockedSessions, counts?.blocked ?? 0),
     working: Math.max(s.workingSessions, counts?.working ?? 0),
-    // `claudeIsIdle` is gated on a running shell where it is computed; a
-    // declared or detected idle agent is a claim in its own right and needs no
-    // such gate.
-    idle: s.claudeIsIdle || (counts?.idle ?? 0) > 0,
+    // Only the roster can claim idle: a declared or detected idle agent is a
+    // claim in its own right, whereas retained hook or observer history is
+    // not, and a released agent's leftover activity must not read as one.
+    idle: (counts?.idle ?? 0) > 0,
   };
 }
 
@@ -128,6 +131,12 @@ export function claudeStatusText(s: StatusTextInputs, t: T): string | null {
   // summaries on purpose — everything else describes work that proceeds on its
   // own, this describes work that has stopped until the user acts (issue #128).
   if (agent.blocked > 0) return needsYouText(agent.blocked, t);
+
+  // Priority 0.3: an agent finished its turn on an ordinary question. Below a
+  // permission prompt (that one stops work), above the running summaries: the
+  // user is the only thing the next step is waiting for. Read off the roster
+  // directly — it is a screen/roster fact with no older hook signal to join.
+  if ((s.agentCounts?.question ?? 0) > 0) return t('workspaceRow.question', 'Question for you');
 
   // Priority 0.5: agents are running — show the orchestration summary
   if (s.runningAgentCount > 0) {
@@ -188,6 +197,7 @@ export function statusClassFor(s: StatusTextInputs): string {
   }
   const agent = mergedAgentSignals(s);
   if (agent.blocked > 0) return 'workspace-row__status--blocked';
+  if ((s.agentCounts?.question ?? 0) > 0) return 'workspace-row__status--question';
   if (s.runningAgentCount > 0) return 'workspace-row__status--working';
   const shells = (s.backgroundShellCount ?? 0) > 0;
   if (s.sessionCount >= 2) {
@@ -243,6 +253,7 @@ export function stateDotClassFor(s: StatusTextInputs, isClaudeActive: boolean): 
   if (s.statusOverride) return `workspace-row__state-dot--${s.statusOverride}`;
   const agent = mergedAgentSignals(s);
   if (agent.blocked > 0) return 'workspace-row__state-dot--blocked';
+  if ((s.agentCounts?.question ?? 0) > 0) return 'workspace-row__state-dot--question';
   // Mirrors Priority 0.5: a row reading "Orchestrating" (a background subagent
   // still at work after its parent's turn ended, #272) must not wear an idle dot.
   // And Priority 1.75: a background shell is work in flight, not idleness (#276).

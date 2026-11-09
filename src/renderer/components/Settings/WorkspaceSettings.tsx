@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { useStore } from '../../store';
 import { useT } from '../../i18n';
 import { getAllPaneIds, findLeaf, patchLeafPrimarySurface, MAX_WORKSPACE_PANES } from '../../store/split-utils';
-import type { PaneId, WorkspaceLayout } from '../../../shared/types';
+import type { PaneId, WorkspaceLayout, KeepAwakeMode } from '../../../shared/types';
+import { useKeepAwake } from '../../hooks/useKeepAwake';
 
 /**
  * One editable startup-command line for a saved layout's pane.
@@ -91,8 +92,10 @@ export default function WorkspaceSettings() {
   const t = useT();
   const {
     workspacePrefs, setWorkspacePrefs,
-    savedLayouts, setSavedLayouts, saveCurrentLayoutAsPreset, updateLayoutFromCurrent,
+    savedLayouts, setSavedLayouts, requestLayoutSave, updateLayoutFromCurrent,
   } = useStore();
+  // Keep-awake lives in main (issue #363), not in workspacePrefs.
+  const keepAwake = useKeepAwake();
   // Which layout id was just overwritten, for a transient "Saved" confirmation
   // next to its button — unlike "+ Save as new preset", overwriting an
   // existing row changes data invisibly (the row itself doesn't change shape).
@@ -135,7 +138,7 @@ export default function WorkspaceSettings() {
     if (workspacePrefs.defaultLayoutId === id) setWorkspacePrefs({ defaultLayoutId: null });
   };
   const saveCurrent = () => {
-    saveCurrentLayoutAsPreset(
+    requestLayoutSave(
       t('settings.workspacePanel.newLayoutName', 'Layout {n}').replace('{n}', String(savedLayouts.length + 1)),
     );
   };
@@ -245,6 +248,22 @@ export default function WorkspaceSettings() {
       </p>
 
       <div className="settings-row">
+        <label className="settings-label">{t('settings.workspacePanel.closeToTray', 'Close to tray')}</label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={workspacePrefs.closeToTray}
+          onChange={(e) => setWorkspacePrefs({ closeToTray: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.workspacePanel.closeToTrayHint',
+          "The window's × button or Alt+F4 hides the last wmux window to the system tray instead of quitting, so terminal sessions and agents keep running. Click the tray icon to bring it back; Quit wmux in its menu quits for real. Takes priority over the confirmation above.",
+        )}
+      </p>
+
+      <div className="settings-row">
         <label className="settings-label" htmlFor="session-snapshot-minutes">
           {t('settings.workspacePanel.sessionSnapshot', 'Snapshot sessions every')}
         </label>
@@ -308,7 +327,7 @@ export default function WorkspaceSettings() {
         />
       </div>
       <p className="settings-hint">
-        {t('settings.workspacePanel.restoreOpencodeSessionsHint', "Reopens each restored tab's OpenCode session with `opencode -s`, in the directory it was in. Needs the wmux OpenCode plugin (Agent integration on). An OpenCode you quit normally is not reopened. If a session was deleted since, OpenCode starts a new one instead. OpenCode 2 is captured only when started with --standalone: its shared background server cannot tell tabs apart.")}
+        {t('settings.workspacePanel.restoreOpencodeSessionsHint', "Reopens each restored tab's OpenCode session with `opencode -s`, in the directory it was in. Needs the wmux OpenCode integration (the server plugin, or the TUI plugin installed with `wmux opencode-tui` for OpenCode 2). An OpenCode you quit normally is not reopened. If a session was deleted since, OpenCode starts a new one instead. OpenCode 2 on a remote or shared server is captured by the TUI plugin; re-run `wmux opencode-tui` in that environment after a wmux update.")}
       </p>
 
       <div className="settings-row">
@@ -351,6 +370,19 @@ export default function WorkspaceSettings() {
       </p>
 
       <div className="settings-row">
+        <label className="settings-label">{t('settings.workspacePanel.restorePiSessions', 'Resume pi sessions on restore')}</label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={workspacePrefs.restorePiSessions}
+          onChange={(e) => setWorkspacePrefs({ restorePiSessions: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t('settings.workspacePanel.restorePiSessionsHint', "Reopens each restored tab's exact pi session with `pi --session <path>`, in the directory it was in. Needs the wmux pi extension (Status hooks on). A session is recorded once pi has written it (after its first reply). A pi you quit is not reopened; switching sessions with /new, /resume or /fork records the new one. Tabs whose session file is gone or empty are skipped rather than opened as a new session.")}
+      </p>
+
+      <div className="settings-row">
         <label className="settings-label">{t('settings.workspacePanel.detectAgentScreens', 'Read agent screens to infer state')}</label>
         <input
           type="checkbox"
@@ -362,7 +394,7 @@ export default function WorkspaceSettings() {
       <p className="settings-hint">
         {t(
           'settings.workspacePanel.detectAgentScreensHint',
-          'For agents that do not report state themselves (Codex, Gemini, Aider…), match their on-screen UI against bundled rules to tell blocked from working. Runs entirely on this machine and never overrides what an agent declares — panes whose agent reports are skipped without being read at all. Override the rules in %APPDATA%\\wmux\\agent-detection, and use `wmux detect explain` to see which rule fired.',
+          'For agents that do not report state themselves (Codex, Gemini, Aider…), match their on-screen UI against bundled rules to tell blocked from working. Runs entirely on this machine and never overrides what an agent declares — it only refines a declared idle into a question still on screen, and panes whose agent reports working or blocked are not read at all. Override the rules in %APPDATA%\\wmux\\agent-detection, and use `wmux detect explain` to see which rule fired.',
         )}
       </p>
 
@@ -378,7 +410,7 @@ export default function WorkspaceSettings() {
       <p className="settings-hint">
         {t(
           'settings.workspacePanel.explorerOpenByDefaultHint',
-          'Opens the file explorer on the right of every workspace, with live +/- line counts per file and the files your agent is editing. Works in any folder: a git repo is compared to its last commit, any other folder to how it looked when the panel opened. Closing it hides it until you switch workspace; turn this off to hide it everywhere.',
+          'Opens the file explorer on the right of every workspace, with live +/- line counts per file and the files your agent is editing. Works in any folder: a git repo is compared to its last commit, any other folder to how it looked when the panel opened. Closing it in a workspace keeps it closed there; turn this off to hide it everywhere. A workspace whose terminals have not reported a folder yet does not open it.',
         )}
       </p>
 
@@ -395,6 +427,41 @@ export default function WorkspaceSettings() {
         {t(
           'settings.workspacePanel.autoOpenDiffHint',
           'When an agent edits or writes files, wmux pops a diff tab in the bottom pane. Turn this off to stop it appearing.',
+        )}
+      </p>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.workspacePanel.keepAwakeMode', 'Keep computer awake')}</label>
+        <select
+          className="settings-select"
+          value={keepAwake.state.mode}
+          onChange={(e) => keepAwake.setMode(e.target.value as KeepAwakeMode)}
+        >
+          <option value="smart">{t('settings.workspacePanel.keepAwakeSmart', 'Smart (when agents are working)')}</option>
+          <option value="always">{t('settings.workspacePanel.keepAwakeAlways', 'Always (keep awake while wmux is open)')}</option>
+          <option value="off">{t('settings.workspacePanel.keepAwakeOff', 'Off (system defaults)')}</option>
+        </select>
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.workspacePanel.keepAwakeHint',
+          'Prevents Windows from sleeping while coding agents are working. Smart mode only engages for agents that report a working state through hooks — Claude Code, Qwen Code, Grok, the OpenCode plugin, or `wmux report-agent` — and releases it when they are idle or waiting on you. A working claim not renewed for 15 minutes stops counting.',
+        )}
+      </p>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.workspacePanel.preventDisplaySleep', 'Keep display awake')}</label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={keepAwake.state.preventDisplaySleep}
+          onChange={(e) => keepAwake.setPreventDisplaySleep(e.target.checked)}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.workspacePanel.preventDisplaySleepHint',
+          'Also keep screens awake to prevent Windows lock screen or display timeout. When disabled (default), system sleep is prevented while screens may turn off.',
         )}
       </p>
 

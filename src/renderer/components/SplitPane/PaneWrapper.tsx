@@ -1,13 +1,17 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { PaneId, SplitNode, SurfaceId, WorkspaceId, QuickLaunchProfile, ShellInfo, engineOf } from '../../../shared/types';
 import { workspaceFallbackCwd } from '../../../shared/paths';
-import { findLeaf, splitNode } from '../../store/split-utils';
-import TerminalPane from '../Terminal/TerminalPane';
+import { activeTerminalShell, findLeaf, splitNode } from '../../store/split-utils';
+import KeptAliveTerminal from '../Terminal/KeptAliveTerminal';
 import BrowserPane from '../Browser/BrowserPane';
+import { ExplorerPanel } from '../Explorer/ExplorerPanel';
 import MarkdownPane from '../Markdown/MarkdownPane';
 import DiffPane from '../Diff/DiffPane';
+import { worktreeDiffBase } from '../Diff/diff-base';
 import CodePane from '../Code/CodePane';
 import PromptsPane from '../Terminal/PromptsPane';
+import GitPane from '../Git/GitPane';
+import { gitRootFor } from '../Git/open-git';
 import NotificationRing from '../Terminal/NotificationRing';
 import SurfaceTabBar from './SurfaceTabBar';
 import { useStore } from '../../store';
@@ -34,6 +38,14 @@ interface PaneWrapperProps {
   onSurfaceDragPreviewTarget: (targetPaneId: PaneId, target: SurfaceDragPreviewTarget) => void;
   onClearSurfaceDragPreview: () => void;
   onSurfaceDragCommit: (options?: SurfaceDragCommitOptions) => void;
+  /**
+   * Focus this pane. The leaf's React onClick never sees a click on a terminal,
+   * which is portalled from TerminalHost (#346), so the terminal slot calls it.
+   */
+  onActivate?: () => void;
+  /** Focus another pane — the one a split from this pane's tab bar just created. */
+  onFocusPane?: (paneId: PaneId) => void;
+  paneZoom?: number;
 }
 
 export default function PaneWrapper({
@@ -46,6 +58,9 @@ export default function PaneWrapper({
   onSurfaceDragPreviewTarget,
   onClearSurfaceDragPreview,
   onSurfaceDragCommit,
+  onActivate,
+  onFocusPane,
+  paneZoom = 1,
 }: PaneWrapperProps) {
   const { surfaces, activeSurfaceIndex, paneId } = leaf;
 
@@ -54,6 +69,7 @@ export default function PaneWrapper({
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const addSurface = useStore((s) => s.addSurface);
   const updateSurface = useStore((s) => s.updateSurface);
+  const setBrowserTitle = useStore((s) => s.setBrowserTitle);
   const requestCloseSurface = useStore((s) => s.requestCloseSurface);
   const duplicateSurface = useStore((s) => s.duplicateSurface);
   const closeOtherSurfaces = useStore((s) => s.closeOtherSurfaces);
@@ -66,6 +82,7 @@ export default function PaneWrapper({
   const shortcuts = useStore((s) => s.shortcuts);
   const workspace = useStore((s) => s.workspaces.find(w => w.id === workspaceId));
   const globalProfiles = useStore((s) => s.quickLaunchProfiles);
+  const defaultShell = useStore((s) => s.workspacePrefs.defaultShell);
   const [projectProfiles, setProjectProfiles] = useState<QuickLaunchProfile[]>([]);
   const [availableShells, setAvailableShells] = useState<ShellInfo[]>([]);
 
@@ -113,28 +130,17 @@ export default function PaneWrapper({
     for (const surfaceId of surfaceIds) markRead(surfaceId as SurfaceId);
   }, [surfaceIds, markRead]);
 
-  // When pane receives focus, mark all surfaces as read.
-  //
-  // Deliberately keyed on the focus TRANSITION and nothing else. Adding
-  // `hasUnread` here is the tempting one-word fix for the stuck ring below, and
-  // it is wrong: the effect would then run on the same render the notification
-  // arrives, so a pane you are already looking at would clear its ring before
-  // ever painting it — no glow, and the 950ms flash above cut off mid-animation.
-  // That trades a ring that will not leave for one you can never see.
-  //
-  // Still needed alongside the interaction listener: switching panes by keyboard
-  // (Ctrl+Alt+arrow) lands no click and no keystroke inside the new pane.
+  // Arrival-time focus is handled by addNotification. Keep this keyed only on
+  // focus transitions so hidden-tab alerts remain unread until acknowledged.
+  // Keyboard pane navigation lands no interaction inside the destination pane.
   useEffect(() => {
     if (isFocused && hasUnread) markPaneRead();
   }, [isFocused]);
 
   // ...and clear it on actual INTERACTION, which is the case focus alone misses.
   //
-  // A notification that arrives while the pane is ALREADY focused never changes
-  // `isFocused`, so the effect above does not re-run and the ring sits there
-  // while the user types into the very pane it is pointing at. The only way out
-  // was to click another pane and click back — manufacturing the transition by
-  // hand.
+  // Notifications from hidden tabs or an inactive window can still be unread
+  // when the pane is already focused; the next interaction acknowledges them.
   //
   // Capture phase is load-bearing for keydown: xterm's hidden helper textarea is
   // a descendant of this element and consumes the event, so a bubble-phase
@@ -168,7 +174,7 @@ export default function PaneWrapper({
 
       // Match find shortcut (default: Ctrl+F)
       const matchesFind =
-        e.key === findBinding.key &&
+        !!findBinding.key && e.key === findBinding.key &&
         !!findBinding.ctrl === e.ctrlKey &&
         !!findBinding.shift === e.shiftKey &&
         !!findBinding.alt === e.altKey;
@@ -181,7 +187,7 @@ export default function PaneWrapper({
 
       // Match copy mode shortcut (default: Ctrl+Alt+[)
       const matchesCopyMode =
-        e.key === copyModeBinding.key &&
+        !!copyModeBinding.key && e.key === copyModeBinding.key &&
         !!copyModeBinding.ctrl === e.ctrlKey &&
         !!copyModeBinding.shift === e.shiftKey &&
         !!copyModeBinding.alt === e.altKey;
@@ -258,13 +264,18 @@ export default function PaneWrapper({
             // visible workspace. Gate on isWorkspaceActive to respect parent.
             visibility: isVisible ? 'visible' : 'hidden',
             zIndex: isActive ? 1 : 0,
+            // A terminal zooms through its font instead (#420, see paneFontSize).
+            ...(surface.type !== 'terminal' && paneZoom !== 1 ? { zoom: paneZoom } : {}),
           }}
         >
           {surface.type === 'terminal' && (
-            <TerminalPane
+            // The terminal itself lives in TerminalHost and survives this pane
+            // remounting (#346); this is only the slot it is shown in.
+            <KeptAliveTerminal
               surfaceId={surface.id}
+              onActivate={onActivate}
               shell={surface.shell || workspace?.shell}
-              cwd={surface.cwd || workspaceFallbackCwd(surface.shell || workspace?.shell, workspace)}
+              cwd={surface.cwd || workspaceFallbackCwd(surface.shell || workspace?.shell || defaultShell, workspace)}
               colorScheme={surface.colorScheme}
               startupCommands={surface.startupCommands}
               env={surface.env}
@@ -274,17 +285,27 @@ export default function PaneWrapper({
               agySessionId={surface.agySessionId}
               qwenSessionId={surface.qwenSessionId}
               ompSessionId={surface.ompSessionId}
+              piSessionFile={surface.piSessionFile}
               focused={isFocused && isActive}
               visible={isVisible}
               showFindBar={findBarVisible && isFocused && isActive}
               onFindBarClose={handleFindBarClose}
               copyModeActive={copyModeActive && isFocused && isActive}
+              fontZoom={paneZoom}
             />
           )}
           {surface.type === 'browser' && (
             <BrowserPane
               surfaceId={surface.id}
               workspaceId={workspaceId}
+              // The layer above hides it; BrowserPane needs to know so a pane
+              // an agent drives can keep painting meanwhile.
+              visible={isVisible}
+              onActivate={onActivate}
+              focused={isFocused && isActive}
+              // Right-click → "Open link in new tab" (#439), Ctrl+click or
+              // middle-click: a tab beside this one.
+              onOpenInNewTab={(u, o) => { addSurface(workspaceId, paneId, 'browser', { url: u, background: o?.background }); }}
               // Remembered page, then the configured Start page, then blank.
               // The Start page link is new in #232: a browser TAB used to skip
               // `browserPrefs.defaultUrl` entirely and go straight to
@@ -313,6 +334,7 @@ export default function PaneWrapper({
                   updateSurface(workspaceId, paneId, surface.id, { url: u });
                 }
               }}
+              onTitleChange={(title) => setBrowserTitle(surface.id, title)}
               // Back/Forward across that same remount, and across a restart
               // (#315). Same guard as the URL: a stack whose page would not be
               // remembered is not remembered either.
@@ -362,22 +384,49 @@ export default function PaneWrapper({
                 })}
             />
           )}
-          {surface.type === 'diff' && <DiffPane surfaceId={surface.id} cwd={workspace?.cwd} />}
+          {/* A tab opened from the explorer is pinned to the explorer's root
+              (#325); one made by Ctrl+Shift+G follows the workspace. A
+              worktree workspace's base applies only inside its worktree. */}
+          {surface.type === 'diff' && (
+            <DiffPane
+              surfaceId={surface.id}
+              cwd={surface.cwd ?? workspace?.cwd}
+              baseRef={worktreeDiffBase(surface.cwd ?? workspace?.cwd, workspace?.worktree)}
+            />
+          )}
           {surface.type === 'code' && <CodePane surfaceId={surface.id} />}
+          {surface.type === 'explorer' && (
+            <ExplorerPanel docked workspaceId={workspaceId} rootSurfaceId={surface.explorerRootSurfaceId}
+              focusedPaneId={paneId} onClose={() => useStore.getState().requestCloseSurface(workspaceId, paneId, surface.id)} />
+          )}
           {surface.type === 'prompts' && <PromptsPane surfaceId={surface.id} />}
+          {/* Pinned to its own folder (#362): it never follows focus. */}
+          {surface.type === 'git' && (
+            <GitPane
+              surfaceId={surface.id}
+              cwd={surface.cwd ?? workspace?.cwd}
+              surface={surface}
+              onPatch={(patch) => updateSurface(workspaceId, paneId, surface.id, patch)}
+            />
+          )}
         </div>
       );
     });
 
   const handleNewSurface = () => {
     if (activeWorkspaceId) {
-      addSurface(activeWorkspaceId, paneId, 'terminal');
+      addSurface(activeWorkspaceId, paneId, 'terminal', { shell: activeTerminalShell(leaf) });
     }
   };
 
-  const handleNewSurfaceTyped = (type: 'terminal' | 'browser' | 'markdown' | 'prompts') => {
+  const handleNewSurfaceTyped = (type: 'terminal' | 'browser' | 'markdown' | 'prompts' | 'git') => {
     if (activeWorkspaceId) {
-      addSurface(activeWorkspaceId, paneId, type);
+      // A Git tab pins the folder it opens on (#362) — this pane's terminal.
+      const gitRoot = type === 'git' && workspace ? gitRootFor(workspace, paneId) : undefined;
+      let options: { shell?: string; cwd?: string } | undefined;
+      if (type === 'terminal') options = { shell: activeTerminalShell(leaf) };
+      else if (gitRoot) options = { cwd: gitRoot };
+      addSurface(activeWorkspaceId, paneId, type, options);
     }
   };
 
@@ -500,27 +549,27 @@ export default function PaneWrapper({
     }
   };
 
-  const handleSplitRight = () => {
+  const splitAndFocus = (direction: 'horizontal' | 'vertical') => {
     if (!activeWorkspaceId) return;
     const { workspaces, updateSplitTree } = useStore.getState();
     const ws = workspaces.find(w => w.id === activeWorkspaceId);
     if (ws) {
       const newPaneId = `pane-${crypto.randomUUID()}` as PaneId;
-      const newTree = splitNode(ws.splitTree, paneId, newPaneId, 'terminal', 'horizontal');
+      const newTree = splitNode(ws.splitTree, paneId, newPaneId, 'terminal', direction,
+        activeTerminalShell(findLeaf(ws.splitTree, paneId)));
+      if (newTree === ws.splitTree) return; // pane not in the tree: no split, nothing to focus
       updateSplitTree(activeWorkspaceId, newTree);
+      // Deferred, not called inline: the button's click goes on to bubble up to
+      // the leaf's onClick in SplitContainer (the layout menu too — portals
+      // bubble through the React tree), which focuses THIS pane. Both updates
+      // land in one batch and the last one wins, so an inline call would hand
+      // focus straight back to the pane that was split.
+      queueMicrotask(() => onFocusPane?.(newPaneId));
     }
   };
 
-  const handleSplitDown = () => {
-    if (!activeWorkspaceId) return;
-    const { workspaces, updateSplitTree } = useStore.getState();
-    const ws = workspaces.find(w => w.id === activeWorkspaceId);
-    if (ws) {
-      const newPaneId = `pane-${crypto.randomUUID()}` as PaneId;
-      const newTree = splitNode(ws.splitTree, paneId, newPaneId, 'terminal', 'vertical');
-      updateSplitTree(activeWorkspaceId, newTree);
-    }
-  };
+  const handleSplitRight = () => splitAndFocus('horizontal');
+  const handleSplitDown = () => splitAndFocus('vertical');
 
   const handleClosePane = () => {
     if (!activeWorkspaceId) return;

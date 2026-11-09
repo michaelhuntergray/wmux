@@ -1,7 +1,10 @@
 import { StateCreator } from 'zustand';
 import { QuickLaunchProfile, SavedLayout } from '../../shared/types';
+import { DEFAULT_INACTIVE_PANE_DIM_PCT } from '../../shared/inactive-pane-dim';
 import { INDEX_MODIFIER_CHOICES, IndexModifiers, reconcileIndexModifiers } from '../utils/index-shortcuts';
 import { bindingsEqual } from '../utils/shortcut-binding';
+import type { BellStyle } from '../utils/terminal-bell';
+import type { RightClickMode } from '../utils/terminal-right-click';
 import type { WorkspaceLayout } from './split-utils';
 import {
   Language,
@@ -127,7 +130,7 @@ function persist<T>(key: string, value: T): void {
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ShortcutBinding {
-  key: string; // e.g., 'n', 'd', 'w', 'b', 'PageDown'
+  key: string; // Empty means explicitly unbound; deleting the entry would restore its default.
   ctrl?: boolean;
   shift?: boolean;
   alt?: boolean;
@@ -177,6 +180,8 @@ export type ShortcutAction =
   | 'commandPalette'
   | 'openMarkdownPanel'
   | 'openDiffPanel'
+  // ─── issue #362 ───────────────────────────────────────────────────────────
+  | 'openGitPanel'
   // ─── issue #64: high-value additions ──────────────────────────────────────
   | 'reopenClosedSurface'
   | 'findNext'
@@ -193,12 +198,15 @@ export type ShortcutAction =
   | 'toggleMarkdownSource'
   // ─── issue #175 ───────────────────────────────────────────────────────────
   | 'resetTerminal'
+  | 'clearTerminalBuffer'
   // ─── file explorer panel ──────────────────────────────────────────────────
   | 'toggleExplorer'
+  | 'toggleDictation'
   // ─── issue #207: the prompt log and its four consumers ────────────────────
   | 'togglePromptOutline'
   | 'togglePinnedPrompt'
-  | 'followOutput';
+  | 'followOutput'
+  | 'refreshSurface';
 
 // ─── Default shortcuts ────────────────────────────────────────────────────────
 
@@ -247,6 +255,10 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, ShortcutBinding> = {
   commandPalette:    { key: 'p', ctrl: true, shift: true },
   openMarkdownPanel: { key: 'm', ctrl: true, shift: true },
   openDiffPanel:     { key: 'g', ctrl: true, shift: true },
+  // The project Git view (#362). Ctrl+Alt+G was unbound; G beside the Diff
+  // panel's Ctrl+Shift+G because they answer neighbouring questions. Alt-
+  // modified, so isSafeToIntercept leaves bare Ctrl+G to the terminal.
+  openGitPanel:      { key: 'g', ctrl: true, alt: true },
   // ─── issue #64 ──────────────────────────────────────────────────────────────
   // Defaults collision-checked against the bindings above. All use Shift/Alt or
   // function keys, so isSafeToIntercept() forwards bare-Ctrl combos to the
@@ -274,12 +286,16 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, ShortcutBinding> = {
   // since the users who need this binding are the ones already fighting their
   // shell.
   resetTerminal:          { key: 'r', ctrl: true, shift: true },
+  clearTerminalBuffer:    { key: '' },
   // ─── file explorer panel ─────────────────────────────────────────────────
   // Ctrl+Shift+E is toggleMarkdownSource (#116), so the explorer takes X.
   // Shift-modified, so isSafeToIntercept needs no change and bare Ctrl+X still
   // reaches the terminal. Users wanting VS Code muscle memory can swap the two
   // in Settings → Keyboard, which is what #202/#203 landed for.
   toggleExplorer:    { key: 'x', ctrl: true, shift: true },
+  // Unbound: dictation is opt-in (workspacePrefs.dictationEnabled), so a
+  // default combo would be taken from terminal programs for a hidden feature.
+  toggleDictation:   { key: '' },
   // ─── Agent roster ───────────────────────────────────────────────────────────
   // Ctrl+Shift+B and Ctrl+Shift+A were both unbound. Shift-modified like every
   // batch above, so isSafeToIntercept keeps bare Ctrl+A (start-of-line in every
@@ -313,6 +329,7 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, ShortcutBinding> = {
   togglePromptOutline:    { key: 'l', ctrl: true, shift: true },
   togglePinnedPrompt:     { key: 'k', ctrl: true, shift: true },
   followOutput:           { key: 'End', ctrl: true, shift: true },
+  refreshSurface:         { key: 'F5' },
 };
 
 // ─── Shortcut default promotions (#249) ──────────────────────────────────────
@@ -418,6 +435,40 @@ export interface SidebarPrefs {
   hideAllDetails: boolean;
   activeTabIndicator: 'leftRail' | 'solidFill';
   backgroundOpacity: number; // 0–100
+  /**
+   * Sidebar text size as a percentage of the shipped sizes (#319), independent
+   * of the terminal font. Applied as `--sidebar-text-scale`, which every
+   * font-size in sidebar.css multiplies by. 100 is the shipped look.
+   */
+  textScale: number;
+  /**
+   * Let a long workspace title wrap to two lines before it is truncated (#342).
+   * Off by default: one line is the shipped look, and the layout picker spec
+   * keeps it. A new field, so stored prefs pick it up from the defaults.
+   */
+  wrapTitles: boolean;
+  /**
+   * Give the workspace title the row's full width: the state dot, the tool-call
+   * odometer, the unread badge and the hover-only close button move to a line
+   * above the title, so the title and the status text each get a full line.
+   * Lets the sidebar be narrower. Off by default: the title line is the
+   * shipped look.
+   */
+  fullWidthTitles: boolean;
+}
+
+export const SIDEBAR_TEXT_SCALE_MIN = 90;
+export const SIDEBAR_TEXT_SCALE_MAX = 150;
+
+/**
+ * The scale factor to apply, from a stored percentage. The value comes from
+ * localStorage, so anything that is not a finite number in range is clamped
+ * or falls back to 1 rather than collapsing the sidebar's text.
+ */
+export function sidebarTextScale(percent: unknown): number {
+  if (typeof percent !== 'number' || !Number.isFinite(percent)) return 1;
+  const clamped = Math.min(SIDEBAR_TEXT_SCALE_MAX, Math.max(SIDEBAR_TEXT_SCALE_MIN, percent));
+  return clamped / 100;
 }
 
 export const DEFAULT_SIDEBAR_PREFS: SidebarPrefs = {
@@ -429,11 +480,17 @@ export const DEFAULT_SIDEBAR_PREFS: SidebarPrefs = {
   hideAllDetails: false,
   activeTabIndicator: 'leftRail',
   backgroundOpacity: 100,
+  textScale: 100,
+  wrapTitles: false,
+  fullWidthTitles: false,
 };
 
 // ─── Workspace settings ───────────────────────────────────────────────────────
 
 export interface WorkspacePrefs {
+  /** Location of the shared explorer; docked tabs store their own root. */
+  explorerPosition: 'right' | 'sidebar';
+  explorerSidebarRatio: number;
   newWorkspacePlacement: 'afterCurrent' | 'top' | 'end';
   autoReorderOnNotification: boolean;
   defaultShell: string;
@@ -468,6 +525,11 @@ export interface WorkspacePrefs {
    */
   explorerOpenByDefault: boolean;
   /**
+   * ChatGPT Web dictation (#438). Opt-in: off, the titlebar has no microphone
+   * and wmux never loads chatgpt.com.
+   */
+  dictationEnabled: boolean;
+  /**
    * Ask before closing a session (issue #90): an accidental × click or
    * Ctrl+Shift+W kills every PTY in the workspace, including agents that
    * haven't persisted their state yet. Opt-in — off by default so the
@@ -485,6 +547,15 @@ export interface WorkspacePrefs {
    * `wmux close-window` never prompt.
    */
   confirmAppClose: boolean;
+  /**
+   * Close to tray (issue #442): the window's ×, Alt+F4 or the closeWindow
+   * shortcut HIDES the last visible window behind a tray icon instead of
+   * quitting, so every PTY and agent keeps running. Opt-in. Decided in MAIN
+   * (`close-guard.ts`) off settings.json at close time, like the one above,
+   * and wins over it: hiding ends nothing, so there is nothing to confirm.
+   * Quit from the tray, updates, relaunches and Windows shutdown still quit.
+   */
+  closeToTray: boolean;
   /**
    * Read agent TUIs off the screen to infer blocked/working/idle for agents
    * that do not report state themselves (Codex, Gemini, Aider, …).
@@ -542,6 +613,11 @@ export interface WorkspacePrefs {
    */
   restoreOmpSessions: boolean;
   /**
+   * Opt-in: reopen each tab's pi session file with `pi --session <path>`
+   * (#382). Off by default, like the others.
+   */
+  restorePiSessions: boolean;
+  /**
    * How many terminal panes a new workspace opens with, and how they sit
    * (issue #212).
    *
@@ -581,6 +657,8 @@ export interface WorkspacePrefs {
 }
 
 export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
+  explorerPosition: 'right',
+  explorerSidebarRatio: 0.45,
   newWorkspacePlacement: 'afterCurrent',
   autoReorderOnNotification: false,
   defaultShell: '',
@@ -588,8 +666,10 @@ export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   showWelcomeScreen: true,
   autoOpenDiffTab: true,
   explorerOpenByDefault: true,
+  dictationEnabled: false,
   confirmWorkspaceClose: false,
   confirmAppClose: false,
+  closeToTray: false,
   defaultLayoutId: null,
   restoreClaudeSessions: false,
   restoreCodexSessions: false,
@@ -597,6 +677,7 @@ export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   restoreAgySessions: false,
   restoreQwenSessions: false,
   restoreOmpSessions: false,
+  restorePiSessions: false,
   detectAgentScreens: true,
   newWorkspacePanes: 3,
   newWorkspaceLayout: 'grid',
@@ -646,6 +727,14 @@ export interface TerminalPrefs {
    */
   oscTitleTabs: boolean;
   /**
+   * Name a workspace after the window title its terminal's program sets, while
+   * the workspace still has a name wmux picked (`titleIsDefault`). A name the
+   * user or a caller chose is never replaced. Its own switch rather than
+   * `oscTitleTabs`, so the tabs can follow the title while the sidebar keeps
+   * the names it had. New field, so no promotion needed (see oscTitleTabs).
+   */
+  oscTitleWorkspaces: boolean;
+  /**
    * SGR wheel reports sent per cell of finger travel when a touch pan is
    * forwarded to a mouse-tracking app (issue #267). 1 is one report per cell,
    * which tracks the finger only where the app moves one row per report;
@@ -653,6 +742,19 @@ export interface TerminalPrefs {
    * arrow-key branch, the mouse wheel and the fling are not affected.
    */
   touchPanGain: number;
+  /**
+   * What a bell does in a pane the user can see (#335): flash the pane, play a
+   * soft local beep, or nothing. Off-screen bells are not affected — they
+   * follow `notificationPrefs.bellNotify`. See utils/terminal-bell.ts.
+   */
+  bellStyle: BellStyle;
+  /**
+   * Right-click inside a terminal (#336): copy the selection or paste, as in
+   * Windows Terminal (`copyPaste`), always paste, or nothing. An app with
+   * mouse tracking on gets the click unless Shift is held. See
+   * utils/terminal-right-click.ts.
+   */
+  rightClick: RightClickMode;
   /** User-defined color schemes, addressable by name in per-pane overrides. */
   userColorSchemes: Record<string, UserColorScheme>;
 }
@@ -665,7 +767,10 @@ export const DEFAULT_TERMINAL_PREFS: TerminalPrefs = {
   cursorBlink: true,
   scrollbackLines: 5000,
   oscTitleTabs: true,
+  oscTitleWorkspaces: true,
   touchPanGain: 1,
+  bellStyle: 'visual',
+  rightClick: 'copyPaste',
   userColorSchemes: {},
 };
 
@@ -683,6 +788,12 @@ export interface NotificationPrefs {
   agentInputNotify: boolean;
   /** Notify when an in-pane agent (Claude Code) finishes its turn / Stop hook (issue #53). */
   agentStopNotify: boolean;
+  /**
+   * A bell in a pane the user cannot see — background tab, inactive
+   * workspace, unfocused window — raises a notification (the #53 fallback).
+   * On-screen bells never do; see `terminalPrefs.bellStyle`.
+   */
+  bellNotify: boolean;
 }
 
 export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
@@ -695,6 +806,7 @@ export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
   customSoundName: null,
   agentInputNotify: true,
   agentStopNotify: true,
+  bellNotify: true,
 };
 
 // ─── Browser settings ─────────────────────────────────────────────────────────
@@ -848,7 +960,8 @@ export interface PromptPrefs {
  * touched the panel at all — which is to say, almost nobody who cares. Starting
  * the counter at 0 costs nothing and means the first real default change is a
  * bump plus an entry in PROMPT_PROMOTIONS instead of a migration written under
- * pressure.
+ * pressure. Adding a NEW field needs neither: `{ ...DEFAULTS, ...stored }` fills
+ * it in. Only changing an existing default needs the rev.
  *
  * 0 — 2.4.0, as shipped. No promotion has ever run.
  */
@@ -1092,6 +1205,12 @@ export interface AppearancePrefs {
    */
   windowMaterial: 'clear' | 'acrylic' | 'mica';
   /**
+   * 0–60 (%): how much black is laid over unfocused panes. 0 turns dimming
+   * off; clamped on read by `inactivePaneDimAlpha`. Focus mode ignores it and
+   * keeps its own, stronger dim.
+   */
+  inactivePaneDim: number;
+  /**
    * Sidebar presentation mode. 'classic' is the stock list; 'trace' is the
    * opt-in live view that renders each Claude session as a tap on a copper bus,
    * with motion driven by real hook traffic.
@@ -1163,6 +1282,7 @@ export const DEFAULT_APPEARANCE_PREFS: AppearancePrefs = {
   terminalBgOpacity: 88,
   windowTransparency: false,
   windowMaterial: 'clear',
+  inactivePaneDim: DEFAULT_INACTIVE_PANE_DIM_PCT,
   uiMode: 'trace',
   uiModeDefaultRev: UI_MODE_DEFAULT_REV,
   hubEnabled: true,

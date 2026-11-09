@@ -1,5 +1,5 @@
 import { v4 as uuid } from 'uuid';
-import { SplitNode, PaneId, SurfaceId, SurfaceType, SurfaceRef, WorkspaceLayout } from '../../shared/types';
+import { SplitNode, PaneId, SurfaceId, SurfaceType, SurfaceRef, WorkspaceId, WorkspaceLayout } from '../../shared/types';
 
 // ─── Leaf factory ────────────────────────────────────────────────────────────
 
@@ -47,9 +47,9 @@ export type { WorkspaceLayout };
  * Upper bound on a configured pane count.
  *
  * Not a technical limit — the tree is arbitrarily deep. It is a guard on a
- * value that comes from a hand-edited TOML file and is acted on by SPAWNING A
- * SHELL PER PANE: `panes = 500` is a typo, and honouring it means 500 PTYs on
- * a keypress. Eight is past any layout anyone has asked for.
+ * value that comes from a hand-edited TOML file or over the pipe, and is acted
+ * on by SPAWNING A SHELL PER PANE: `panes = 500` is a typo, and honouring it
+ * means 500 PTYs on a keypress. Eight is past any layout anyone has asked for.
  */
 export const MAX_WORKSPACE_PANES = 8;
 
@@ -148,6 +148,7 @@ function applyMintedIds(template: SplitNode, idMap: Map<SurfaceId, SurfaceId>): 
         delete next.agySessionId;
         delete next.qwenSessionId;
         delete next.ompSessionId;
+        delete next.piSessionFile;
         if (next.codeRootSurfaceId) {
           const root = idMap.get(next.codeRootSurfaceId);
           // An unresolvable root means the captured tree never contained the
@@ -156,6 +157,11 @@ function applyMintedIds(template: SplitNode, idMap: Map<SurfaceId, SurfaceId>): 
           // would look like a file that failed to load for some other reason.
           if (root) next.codeRootSurfaceId = root;
           else delete next.codeRootSurfaceId;
+        }
+        if (next.explorerRootSurfaceId) {
+          const root = idMap.get(next.explorerRootSurfaceId);
+          if (root) next.explorerRootSurfaceId = root;
+          else delete next.explorerRootSurfaceId;
         }
         return next;
       }),
@@ -168,6 +174,15 @@ function applyMintedIds(template: SplitNode, idMap: Map<SurfaceId, SurfaceId>): 
   };
 }
 
+/**
+ * Keep launch arguments (such as a WSL distribution), including those inherited
+ * at spawn time. Non-terminal tabs leave the workspace/default fallback alone.
+ */
+export function activeTerminalShell(leaf: (SplitNode & { type: 'leaf' }) | undefined): string | undefined {
+  const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+  return surface?.type === 'terminal' ? (surface.launchShell || surface.shell || undefined) : undefined;
+}
+
 // ─── splitNode ───────────────────────────────────────────────────────────────
 
 export function splitNode(
@@ -176,10 +191,14 @@ export function splitNode(
   newPaneId: PaneId,
   surfaceType: SurfaceType,
   direction: 'horizontal' | 'vertical',
+  // Only the UI split actions pass this: a CLI or agent split types its
+  // startup commands, which must never land in an inherited ssh or WSL shell.
+  shell?: string,
 ): SplitNode {
   if (tree.type === 'leaf') {
     if (tree.paneId !== targetPaneId) return tree;
     const newLeaf = createLeaf(newPaneId, surfaceType);
+    if (shell && surfaceType === 'terminal') newLeaf.surfaces[0].shell = shell;
     return {
       type: 'branch',
       direction,
@@ -190,8 +209,8 @@ export function splitNode(
 
   // Branch — recurse into children
   const [left, right] = tree.children;
-  const newLeft = splitNode(left, targetPaneId, newPaneId, surfaceType, direction);
-  const newRight = splitNode(right, targetPaneId, newPaneId, surfaceType, direction);
+  const newLeft = splitNode(left, targetPaneId, newPaneId, surfaceType, direction, shell);
+  const newRight = splitNode(right, targetPaneId, newPaneId, surfaceType, direction, shell);
 
   if (newLeft === left && newRight === right) return tree; // nothing changed
   return { ...tree, children: [newLeft, newRight] };
@@ -229,6 +248,24 @@ export function findLeaf(
     return tree.paneId === paneId ? tree : undefined;
   }
   return findLeaf(tree.children[0], paneId) ?? findLeaf(tree.children[1], paneId);
+}
+
+export function findSurfacePane(tree: SplitNode, surfaceId: SurfaceId): PaneId | null {
+  if (tree.type === 'leaf') {
+    return tree.surfaces.some((s) => s.id === surfaceId) ? tree.paneId : null;
+  }
+  return findSurfacePane(tree.children[0], surfaceId) ?? findSurfacePane(tree.children[1], surfaceId);
+}
+
+export function findSurfaceOwner(
+  workspaces: { id: WorkspaceId; splitTree: SplitNode }[],
+  surfaceId: SurfaceId,
+): { workspaceId: WorkspaceId; paneId: PaneId } | null {
+  for (const ws of workspaces) {
+    const paneId = findSurfacePane(ws.splitTree, surfaceId);
+    if (paneId) return { workspaceId: ws.id, paneId };
+  }
+  return null;
 }
 
 // ─── updateRatio ─────────────────────────────────────────────────────────────
@@ -326,6 +363,19 @@ export function collectActiveTerminalSurfaceIds(tree: SplitNode): SurfaceId[] {
     ...collectActiveTerminalSurfaceIds(tree.children[0]),
     ...collectActiveTerminalSurfaceIds(tree.children[1]),
   ];
+}
+
+/**
+ * Whether any terminal in the tree has a directory the explorer could list —
+ * the spawn `cwd` or the one shell integration reported. The explorer roots on
+ * a terminal's cwd, so without one it can only show its "no working directory"
+ * message, and opening it unasked is just noise (#320).
+ */
+export function workspaceHasTerminalCwd(tree: SplitNode): boolean {
+  if (tree.type === 'leaf') {
+    return tree.surfaces.some((s) => s.type === 'terminal' && !!(s.currentCwd || s.cwd));
+  }
+  return workspaceHasTerminalCwd(tree.children[0]) || workspaceHasTerminalCwd(tree.children[1]);
 }
 
 // ─── freezeSurfaceCwds (issue #134: save/restore per-terminal directory) ─────

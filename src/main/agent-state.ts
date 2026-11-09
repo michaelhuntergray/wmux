@@ -35,6 +35,7 @@ import { isValidOpencodeSessionId } from './opencode-resume';
 import { isValidAgyConversationId } from './agy-resume';
 import { isValidQwenSessionId } from './qwen-resume';
 import { isValidOmpSessionId } from './omp-resume';
+import { isValidPiSessionFile } from './pi-resume';
 import { resolveWireChoiceId } from '../shared/remote-console-protocol';
 
 export type AgentRunState = 'blocked' | 'working' | 'idle' | 'unknown';
@@ -104,6 +105,11 @@ export interface AgentStateRecord {
   /** Resumable session handle (a file/id), not a PID — survives a restart. */
   sessionId: string | null;
   sessionProvider?: AgentSessionProvider;
+  /**
+   * Where the session's transcript lives when it is not on Windows: `wsl` for
+   * Claude running inside a WSL pane (#428), whose transcript is in the distro.
+   */
+  sessionHost?: AgentSessionHost;
   /** Session capture alone says nothing about the agent's activity. */
   sessionOnly?: boolean;
   metadata: AgentMetadata;
@@ -140,6 +146,23 @@ export interface AgentStateRecord {
   promptId: number;
   /** What the current prompt's answers were declared as, to tell a re-declaration from a new question. */
   choicesSig: string;
+  /**
+   * Who raised the current block (#399): `hook` when wmux inferred it from a
+   * Claude Code `Notification`, `declared` when the agent said so itself
+   * (`wmux report-agent --blocked`), null when not blocked.
+   *
+   * Only a `hook` block may be retracted by hook evidence that the agent moved
+   * past its prompt (`clearHookBlock`). A declared block is the agent's own
+   * claim and only the agent, the human, or the turn ending may retract it; it
+   * also wins over a hook re-report of the same block, never the reverse.
+   */
+  blockSource: 'hook' | 'declared' | null;
+  /**
+   * When the human last typed something that answers a prompt into this pane
+   * (#399), 0 for never. A hook block FIRED before this moment is already
+   * answered: see the race note in reportAgent.
+   */
+  lastAnswerInputAt: number;
 }
 
 let promptCounter = 0;
@@ -174,6 +197,34 @@ function notifySessionChanged(): void {
 /** Guards against a hostile or buggy reporter growing the map without bound. */
 const MAX_TRACKED_SURFACES = 256;
 
+/**
+ * Handles whose pane lost its process while the agent still held them.
+ *
+ * A PTY that dies under a live agent is not the user leaving the conversation.
+ * An agent that quits on its own releases first (Claude's SessionEnd, the Codex
+ * launcher, the OpenCode plugin), so a pane that reaches `clearAgentState` still
+ * holding a handle had its process killed from outside: a Microsoft Store update
+ * of PowerShell terminates every packaged `pwsh.exe` at once, and so does a
+ * cleanup script or a crash. The run state goes, because it describes a dead
+ * process. The handle stays, so the next restore reopens the conversation
+ * instead of a bare shell in every tab that was working.
+ */
+const orphanedSessions = new Map<SurfaceId, { provider: AgentSessionProvider; sessionId: string; host?: AgentSessionHost }>();
+export function orphanedSession(surfaceId: SurfaceId): { provider: AgentSessionProvider; sessionId: string; host?: AgentSessionHost } | undefined {
+  return orphanedSessions.get(surfaceId);
+}
+
+/**
+ * Where the handle this surface holds (live, or orphaned by a dead PTY) keeps
+ * its transcript: `wsl`, or undefined for Windows. Read at save time next to
+ * the handle itself, so the two always describe the same session.
+ */
+export function agentSessionHost(surfaceId: SurfaceId): AgentSessionHost | undefined {
+  const record = records.get(surfaceId);
+  if (record?.sessionId) return record.sessionHost;
+  return orphanedSessions.get(surfaceId)?.host;
+}
+
 function blank(surfaceId: SurfaceId): AgentStateRecord {
   return {
     surfaceId,
@@ -191,6 +242,8 @@ function blank(surfaceId: SurfaceId): AgentStateRecord {
     blockedSince: null,
     promptId: 0,
     choicesSig: '',
+    blockSource: null,
+    lastAnswerInputAt: 0,
   };
 }
 
@@ -302,6 +355,17 @@ export interface ReportAgentParams {
    * previously declared set alone; an empty array clears it.
    */
   choices?: AgentChoice[];
+  /**
+   * Internal, set by agent-hook-bridge.ts only and never read off the pipe:
+   * this report was inferred from a Claude Code hook, not declared by the agent.
+   */
+  fromHook?: boolean;
+  /**
+   * Internal, hook bridge only (#399): the agent has demonstrably moved past
+   * the prompt it was showing, so retract the block IF a hook raised it. A no-op
+   * for a block the agent declared itself.
+   */
+  clearHookBlock?: boolean;
 }
 
 /**
@@ -382,6 +446,8 @@ function applyBlocked(record: AgentStateRecord, params: ReportAgentParams): void
   // for permission: Bash" can't outlive the prompt it described.
   record.blockedReason = record.awaitingHuman ? (params.reason ?? null) : null;
 
+  record.blockSource = nextBlockSource(record, wasAwaiting, params);
+
   if (wasAwaiting !== record.awaitingHuman) {
     record.choices = [];
     record.choicesSig = '';
@@ -394,6 +460,21 @@ function applyBlocked(record: AgentStateRecord, params: ReportAgentParams): void
   } else if (record.awaitingHuman && record.blockedReason !== prevReason) {
     bumpPrompt(record);
   }
+}
+
+/**
+ * Who owns the block after a report that set `awaitingHuman`. A declared block
+ * outranks a hook's inference of the same block, so a hook report never
+ * downgrades one (see `blockSource`).
+ */
+function nextBlockSource(
+  record: AgentStateRecord,
+  wasAwaiting: boolean,
+  params: ReportAgentParams,
+): AgentStateRecord['blockSource'] {
+  if (!record.awaitingHuman) return null;
+  if (wasAwaiting && params.fromHook) return record.blockSource;
+  return params.fromHook ? 'hook' : 'declared';
 }
 
 /** Apply the declared answers. Omitted leaves them alone; an empty array clears them. */
@@ -434,18 +515,46 @@ export function reportAgent(surfaceId: SurfaceId, params: ReportAgentParams): Ag
   if (!acceptSeq(record, params.seq)) return null;
   if (!acceptHookAt(record, params.hookAt)) return null;
 
+  const effective = resolveHookBlock(record, params);
   // Order matters: applyBlocked may clear the answers of a prompt that has just
   // ended, and applyChoices then installs the ones declared for the new prompt.
   record.sessionOnly = false;
-  applyBlocked(record, params);
-  applyChoices(record, params);
-  applyRunDepth(record, params);
+  applyBlocked(record, effective);
+  applyChoices(record, effective);
+  applyRunDepth(record, effective);
 
   return commit(record);
 }
 
+/**
+ * The blocked half of a hook-sourced report, adjusted for what wmux knows that
+ * the hook did not (#399).
+ *
+ * - `clearHookBlock` becomes a real unblock, but only for a block a hook raised.
+ *   The agent declaring a question itself is a claim no tool event retracts.
+ *
+ * - A hook block FIRED before the human's last answering keystroke is dropped.
+ *   Each hook is its own node process, stamped at start, and on Windows it can
+ *   take a second or more to reach the pipe. A user who answers the permission
+ *   prompt inside that window types while the pane is not yet blocked, so
+ *   noteHumanInput has nothing to clear — and the block then lands after the
+ *   answer and stays until the turn ends. The keystroke came after Claude Code
+ *   showed the prompt (the stamp is taken after it), so it answered it.
+ */
+function resolveHookBlock(record: AgentStateRecord, params: ReportAgentParams): ReportAgentParams {
+  if (params.clearHookBlock && params.awaitingHuman === undefined
+    && record.awaitingHuman && record.blockSource === 'hook') {
+    return { ...params, awaitingHuman: false };
+  }
+  if (params.fromHook && params.awaitingHuman === true && params.hookAt !== undefined
+    && Number.isFinite(params.hookAt) && record.lastAnswerInputAt > params.hookAt) {
+    return { ...params, awaitingHuman: undefined, reason: undefined };
+  }
+  return params;
+}
+
 /** Who a session handle belongs to — it decides the validator and the restore command. */
-export type AgentSessionProvider = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp';
+export type AgentSessionProvider = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp' | 'pi';
 const SESSION_VALIDATORS: Record<AgentSessionProvider, (id: unknown) => id is string> = {
   claude: isValidClaudeSessionId,
   codex: isValidCodexSessionId,
@@ -453,15 +562,20 @@ const SESSION_VALIDATORS: Record<AgentSessionProvider, (id: unknown) => id is st
   agy: isValidAgyConversationId,
   qwen: isValidQwenSessionId,
   omp: isValidOmpSessionId,
+  // A path, checked against pi's sessions dir — the dir default is read per call.
+  pi: (id: unknown): id is string => isValidPiSessionFile(id),
 };
+/** Where a session's transcript lives, when that is not Windows (#428). */
+export type AgentSessionHost = 'wsl';
+
 function isSessionProvider(value: unknown): value is AgentSessionProvider {
-  return value === 'claude' || value === 'codex' || value === 'opencode' || value === 'agy' || value === 'qwen' || value === 'omp';
+  return typeof value === 'string' && Object.hasOwn(SESSION_VALIDATORS, value);
 }
 
 /** `pane.report_agent_session` — tie the pane to a resumable session handle. */
 export function reportAgentSession(
   surfaceId: SurfaceId,
-  params: { seq?: number; sessionId: string | null; provider?: unknown },
+  params: { seq?: number; sessionId: string | null; provider?: unknown; host?: unknown },
 ): AgentStateRecord | null {
   // Validated at the door, not at the point of use (issue #186). This value
   // arrives over the named pipe — a public interface — and since #186 it can
@@ -479,10 +593,14 @@ export function reportAgentSession(
   const record = getOrCreate(surfaceId);
   if (!acceptSeq(record, params.seq)) return null;
   if (sessionOnly) record.sessionOnly = true;
-  const changed = record.sessionId !== sessionId || record.sessionProvider !== provider;
+  // Anything but the one known value means Windows, as every report before #428 did.
+  const host: AgentSessionHost | undefined = params.host === 'wsl' ? 'wsl' : undefined;
+  const changed = record.sessionId !== sessionId || record.sessionProvider !== provider || record.sessionHost !== host;
   record.sessionId = sessionId;
   record.sessionProvider = provider;
+  record.sessionHost = host;
   releasedSessions.delete(surfaceId);
+  orphanedSessions.delete(surfaceId);
   missingSessions.delete(surfaceId);
   const result = commit(record);
   if (changed) notifySessionChanged();
@@ -745,11 +863,17 @@ export function noteHumanInput(surfaceId: SurfaceId, data: string): boolean {
   const record = records.get(surfaceId);
   if (!record) return false;
 
+  const answering = isAnsweringInput(data);
+  // Stamped whether or not the pane is blocked yet: a hook block can still be
+  // on its way to the pipe (#399, see resolveHookBlock).
+  if (answering) record.lastAnswerInputAt = Date.now();
+
   // Escape, alone, against a live run: the turn was cancelled. Clears the block
   // too — escaping a permission prompt dismisses the question with it.
   if (data === '\x1b' && record.runDepth > 0) {
     record.runDepth = 0;
     record.awaitingHuman = false;
+    record.blockSource = null;
     record.blockedReason = null;
     record.blockedSince = null;
     record.choices = [];
@@ -759,9 +883,10 @@ export function noteHumanInput(surfaceId: SurfaceId, data: string): boolean {
   }
 
   if (!record.awaitingHuman) return false;
-  if (!isAnsweringInput(data)) return false;
+  if (!answering) return false;
 
   record.awaitingHuman = false;
+  record.blockSource = null;
   record.blockedReason = null;
   record.blockedSince = null;
   record.choices = [];
@@ -805,8 +930,27 @@ export function releaseAgyAtPrompt(surfaceId: SurfaceId, ranAgy: boolean): boole
   if (!record?.sessionId && !ranAgy) return false;
   // forget() announces a dropped session itself; with none, the restored id in
   // session.json is what changes, so say so for a prompt save.
-  if (record) forget(surfaceId); else releasedSessions.add(surfaceId);
+  if (record) forget(surfaceId);
+  else {
+    releasedSessions.add(surfaceId);
+    orphanedSessions.delete(surfaceId);
+  }
   if (!record?.sessionId) notifySessionChanged();
+  return true;
+}
+
+/**
+ * A pi quit (#382) on a pane wmux holds no record for: the handle that matters
+ * is the one restored into the tab from session.json, which the extension
+ * names but which was never re-reported (pi reports a file only once it is on
+ * disk). Marking the surface released makes the next save drop it, exactly as
+ * `forget()` would have; the caller has already refused this while wmux quits.
+ */
+export function releasePiWithoutRecord(surfaceId: SurfaceId): boolean {
+  if (records.has(surfaceId)) return false;
+  releasedSessions.add(surfaceId);
+  orphanedSessions.delete(surfaceId);
+  notifySessionChanged();
   return true;
 }
 
@@ -818,9 +962,26 @@ export function releaseAgyAtPrompt(surfaceId: SurfaceId, ranAgy: boolean): boole
  * pane as `working` or `blocked` forever. A shell can exit while its tab stays
  * open, so the surface is still on screen to render. Announcing a ghost is the
  * precise failure this whole module exists to prevent.
+ *
+ * It must NOT release the session handle. The process is gone, but nothing says
+ * the user left the conversation (see `orphanedSessions`). Releasing here is what
+ * turned a Store update of PowerShell into every Claude and Codex tab coming
+ * back as a bare shell.
  */
 export function clearAgentState(surfaceId: SurfaceId): void {
-  if (records.has(surfaceId)) forget(surfaceId);
+  const record = records.get(surfaceId);
+  if (!record) return;
+  if (record.sessionId) {
+    if (orphanedSessions.size >= MAX_TRACKED_SURFACES && !orphanedSessions.has(surfaceId)) {
+      orphanedSessions.delete(orphanedSessions.keys().next().value!);
+    }
+    orphanedSessions.set(surfaceId, {
+      provider: record.sessionProvider ?? 'claude',
+      sessionId: record.sessionId,
+      ...(record.sessionHost ? { host: record.sessionHost } : {}),
+    });
+  }
+  forget(surfaceId, { release: false });
 }
 
 /**
@@ -830,12 +991,17 @@ export function clearAgentState(surfaceId: SurfaceId): void {
  * blank record resolves to `idle`, and `idle` is a CLAIM — the sidebar gives a
  * declared state precedence over its own inference. A forgotten pane has made
  * no claim at all, so it must fall back to the heuristic, not be pinned idle.
+ *
+ * `release: false` is the PTY-exit path: the record goes, the handle does not.
  */
-function forget(surfaceId: SurfaceId): void {
-  const hadSession = !!records.get(surfaceId)?.sessionId;
-  releasedSessions.add(surfaceId);
+function forget(surfaceId: SurfaceId, { release = true }: { release?: boolean } = {}): void {
+  const dropsSession = release && (!!records.get(surfaceId)?.sessionId || orphanedSessions.has(surfaceId));
+  if (release) {
+    releasedSessions.add(surfaceId);
+    orphanedSessions.delete(surfaceId);
+  }
   records.delete(surfaceId);
-  if (hadSession) notifySessionChanged();
+  if (dropsSession) notifySessionChanged();
   send({
     surfaceId,
     state: 'unknown',
@@ -912,6 +1078,15 @@ export function currentPromptView(surfaceId: SurfaceId): { reason: string | null
   return { reason: record.blockedReason, choices: record.choices.map(c => ({ id: c.id, label: c.label })) };
 }
 
+/**
+ * Who raised the pane's current block, or null when it is not blocked (#399).
+ * Kept off the snapshot like `currentPromptId`: only the hook bridge needs it.
+ */
+export function getBlockSource(surfaceId: SurfaceId): 'hook' | 'declared' | null {
+  const record = records.get(surfaceId);
+  return record?.awaitingHuman ? record.blockSource : null;
+}
+
 export function getAgentState(surfaceId: SurfaceId): AgentStateSnapshot | undefined {
   const record = records.get(surfaceId);
   return record ? snapshot(record) : undefined;
@@ -978,5 +1153,6 @@ function notifyBroadcastListeners(): void {
 export function resetAgentState(): void {
   records.clear();
   releasedSessions.clear();
+  orphanedSessions.clear();
   missingSessions.clear();
 }

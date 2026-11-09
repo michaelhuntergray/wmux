@@ -1,10 +1,15 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, type CSSProperties } from 'react';
 import AddressBar from './AddressBar';
 import { useT } from '../../i18n';
 import AgentBrowserSetup from './AgentBrowserSetup';
 import { popupBridgeSource } from './popup-bridge';
 import type { BrowserEngine } from '../../../shared/types';
+import { browserUrlLabel } from '../SplitPane/surface-label';
 import { BROWSER_BLANK_PAGE } from '../../utils/browser-start-page';
+import { useKeepRendering } from '../../utils/browser-keep-rendering';
+import { openInNewBrowserTab } from '../../utils/open-in-browser';
+import { buildBrowserContextMenu, isTabOpenableUrl, linkStatusText } from '../../../shared/browser-context-menu';
+import { labelBrowserMenu, runBrowserMenuAction } from './browser-menu-actions';
 import {
   activeHistoryUrl,
   encodeHistoryRestoreSrc,
@@ -15,10 +20,16 @@ import {
 import '../../styles/browser.css';
 
 interface BrowserPaneProps {
+  onMoveToWorkspace?: () => void;
   initialUrl?: string;
   surfaceId: string;
   workspaceId?: string;
   onUrlChange?: (url: string) => void;
+  /**
+   * What the tab should read from the page; '' when the page has no title.
+   * Only a tab passes this: the side panel has no tab to label.
+   */
+  onTitleChange?: (title: string) => void;
   /**
    * Which backend drives this surface. `web` is the Electron <webview> this
    * pane has always been; `agent` points the SAME webview at agent-browser's
@@ -35,6 +46,34 @@ interface BrowserPaneProps {
   initialHistory?: BrowserHistory;
   /** The stack changed — persist it beside the URL. Web mode only. */
   onHistoryChange?: (history: BrowserHistory) => void;
+  /**
+   * Is the pane on screen? False for a background tab and for every pane of an
+   * inactive workspace, which an ancestor hides with `visibility: hidden`. The
+   * pane cannot tell on its own in time to style the webview, so the parent
+   * that does the hiding says so.
+   */
+  visible?: boolean;
+  /**
+   * Focus this pane (#388). A click inside the page is handled by the guest
+   * process and never reaches the host DOM, so the split-tree leaf's onClick
+   * never sees it. The <webview> ELEMENT does receive DOM focus when the guest
+   * takes it, and that is the signal used here.
+   */
+  onActivate?: () => void;
+  /**
+   * Is this the focused pane? When another pane takes focus the webview is
+   * blurred, or it would stay `document.activeElement` and the next click
+   * into it would fire no `focus` event at all.
+   */
+  focused?: boolean;
+  /**
+   * "Open link in new tab" from the right-click menu (#439), or a Ctrl+click
+   * or middle-click on a link: a new browser tab beside this one. The clicks
+   * open it in the `background`, as a browser does. Without it (the side
+   * panel, which has no tabs) the tab goes into the active workspace's panes
+   * instead.
+   */
+  onOpenInNewTab?: (url: string, opts?: { background?: boolean }) => void;
 }
 
 /**
@@ -119,6 +158,17 @@ export function disableTarget(
   const target = result?.url || fallback;
   if (!target || target === showing) return null;
   return target;
+}
+
+/**
+ * A webview's `getTitle()` without the title Chromium makes up for an untitled
+ * page, which is its URL without the scheme. The tab has its own, shorter answer
+ * for that page. Only `getTitle()` needs this: an untitled page fires no
+ * page-title-updated.
+ */
+export function explicitPageTitle(title: string, url: string): string {
+  const bare = (u: string) => u.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  return bare(title) === bare(url) ? '' : title;
 }
 
 /** Address-bar input → a URL, matching the web engine's own resolution. */
@@ -211,7 +261,54 @@ export function elementHidden(el: HTMLElement | null | undefined): boolean {
   return el.offsetParent === null;
 }
 
+/**
+ * A hidden webview an agent is driving: painted, transparent, out of the way.
+ *
+ * `visibility: visible` overrides the hidden ancestor, so Chromium keeps the
+ * guest rendering (frames, requestAnimationFrame, unthrottled timers) and
+ * `capturePage` / `Page.captureScreenshot` get the frame they wait for.
+ * `opacity: 0` keeps it from showing over the pane the user is looking at,
+ * `pointer-events: none` lets the mouse through to that pane, and
+ * `tabIndex = -1` keeps Tab from walking into it: a visible webview is
+ * focusable again, and without it Tab from an input of the workspace on
+ * screen moved focus into the hidden page.
+ *
+ * Measured in a bare Electron 43 harness: the window still showed the active
+ * workspace, its hit test landed on the visible pane, Tab skipped the hidden
+ * webview, and CDP clicks, the accessibility snapshot and both captures still
+ * worked on the hidden page.
+ */
+export const KEEP_RENDERING_STYLE: CSSProperties = {
+  visibility: 'visible',
+  opacity: 0,
+  pointerEvents: 'none',
+};
+
+/**
+ * The webview's own style and tab index. Pure so every case is testable
+ * without a webview.
+ *
+ * Nothing to show (agent setup card, blank page) wins: hidden is exactly what
+ * those want, on screen or off. A hidden pane goes on painting only while an
+ * agent holds a lease on it (utils/browser-keep-rendering.ts); every other
+ * hidden pane inherits `visibility: hidden` and stays throttled like a
+ * background tab, as it always has. Agent mode is excluded: its webview shows
+ * agent-browser's dashboard, and its pages are painted by a real Chrome.
+ */
+export function webviewHiding(s: {
+  overlay: boolean;
+  isBlank: boolean;
+  isAgent: boolean;
+  visible: boolean;
+  keepRendering: boolean;
+}): { style?: CSSProperties; tabIndex?: number } {
+  if (s.overlay || s.isBlank) return { style: { visibility: 'hidden' } };
+  if (!s.visible && s.keepRendering && !s.isAgent) return { style: KEEP_RENDERING_STYLE, tabIndex: -1 };
+  return {};
+}
+
 export default function BrowserPane({
+  onMoveToWorkspace,
   // Blank, not the project's own GitHub repo (#232). A browser surface nobody
   // has given a URL has nowhere to be, and shipping the vendor's page as that
   // answer meant wmux opened its own repo on every launch — then persisted it
@@ -220,11 +317,17 @@ export default function BrowserPane({
   surfaceId,
   workspaceId,
   onUrlChange,
+  onTitleChange,
   engine = 'web',
   onEngineChange,
   initialHistory,
   onHistoryChange,
+  visible = true,
+  onActivate,
+  focused,
+  onOpenInNewTab,
 }: BrowserPaneProps) {
+  const keepRendering = useKeepRendering(surfaceId);
   // src is fixed to the initial page; all later navigation goes through loadURL
   // (below). Binding src to a mutable url state AND calling loadURL made every
   // navigation trigger two loads of the same URL, which raced and produced a
@@ -244,9 +347,21 @@ export default function BrowserPane({
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   const webviewRef = useRef<any>(null);
+  const activateRef = useRef(onActivate);
+  activateRef.current = onActivate;
   const onHistoryChangeRef = useRef(onHistoryChange);
   onHistoryChangeRef.current = onHistoryChange;
+  const onTitleChangeRef = useRef(onTitleChange);
+  onTitleChangeRef.current = onTitleChange;
   const lastHistoryRef = useRef<BrowserHistory | null>(null);
+  // Read by the context-menu listener, which is registered once: `useT()` and
+  // the callback prop are new on every render (#141).
+  const tRef = useRef(t);
+  tRef.current = t;
+  const onOpenInNewTabRef = useRef(onOpenInNewTab);
+  onOpenInNewTabRef.current = onOpenInNewTab;
+  // The URL of the link under the pointer, for the status bar (#439).
+  const [hoverUrl, setHoverUrl] = useState('');
 
   // Agent mode. `agentUrl` is the page the REMOTE Chrome was last asked to
   // open; it is what the address bar shows in agent mode, because the webview's
@@ -362,8 +477,20 @@ export default function BrowserPane({
     webviewRef.current?.goForward();
   }, []);
   const reload = useCallback(() => webviewRef.current?.reload(), []);
+  useEffect(() => {
+    const onRefresh = (event: Event) => {
+      const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
+      if (id === surfaceId) reload();
+    };
+    document.addEventListener('wmux:refresh-surface', onRefresh);
+    return () => document.removeEventListener('wmux:refresh-surface', onRefresh);
+  }, [reload, surfaceId]);
   const stop = useCallback(() => webviewRef.current?.stop(), []);
-  const openDevTools = useCallback(() => webviewRef.current?.openDevTools(), []);
+  const openDevTools = useCallback(() => {
+    if (engineRef.current === 'agent') return;
+    const wcId = webviewRef.current?.getWebContentsId?.();
+    if (typeof wcId === 'number') window.wmux?.browser?.focusDevTools?.(wcId);
+  }, []);
 
   useEffect(() => {
     const wv = webviewRef.current;
@@ -396,6 +523,18 @@ export default function BrowserPane({
       setCanGoForward(wv.canGoForward());
       refreshHistory();
     };
+    // The old page's title goes with its document. Measured on a real webview:
+    // did-navigate always comes before the new page's title event, and a page
+    // with no <title> fires none, so without this it would keep the old title.
+    // Not for an in-page navigation: the document stays, and so does its title.
+    const onNewDocument = (e: any) => {
+      onNavigate(e);
+      if (engineRef.current !== 'agent') onTitleChangeRef.current?.('');
+    };
+    const onTitle = (e: any) => {
+      if (engineRef.current === 'agent') return; // the dashboard's own title
+      onTitleChangeRef.current?.(e.title ?? '');
+    };
     const onStartLoad = () => setIsLoading(true);
     const onStopLoad = () => {
       setIsLoading(false);
@@ -410,26 +549,83 @@ export default function BrowserPane({
     // webview paints ERR_CONNECTION_REFUSED, which the user reads as a broken
     // browser. Catch it and say what actually happened instead.
     const onFailLoad = (e: any) => {
-      if (engineRef.current !== 'agent') return;
       if (e?.isMainFrame === false) return;
+      if (engineRef.current !== 'agent') {
+        // A failed load fires no did-navigate, and the bar now shows the URL that
+        // failed. -3 is ERR_ABORTED: the page was only interrupted, often by the
+        // next navigation, and is not gone.
+        if (e?.errorCode !== -3) onTitleChangeRef.current?.('');
+        return;
+      }
       const dash = dashboardUrlRef.current;
       if (!dash) return; // nothing of ours is loading; not our failure to explain
       const failed = String(e?.validatedURL ?? '');
       if (!failed || failed.startsWith(dash.split('?')[0])) setAgentStatus('no-dashboard');
     };
 
-    wv.addEventListener('did-navigate', onNavigate);
+    wv.addEventListener('did-navigate', onNewDocument);
     wv.addEventListener('did-navigate-in-page', onNavigate);
+    wv.addEventListener('page-title-updated', onTitle);
     wv.addEventListener('did-start-loading', onStartLoad);
     wv.addEventListener('did-stop-loading', onStopLoad);
     wv.addEventListener('did-fail-load', onFailLoad);
 
     return () => {
-      wv.removeEventListener('did-navigate', onNavigate);
+      wv.removeEventListener('did-navigate', onNewDocument);
       wv.removeEventListener('did-navigate-in-page', onNavigate);
+      wv.removeEventListener('page-title-updated', onTitle);
       wv.removeEventListener('did-start-loading', onStartLoad);
       wv.removeEventListener('did-stop-loading', onStopLoad);
       wv.removeEventListener('did-fail-load', onFailLoad);
+    };
+  }, []);
+
+  // Right-click menu and link status bar (#439). Both come from the <webview>
+  // tag's own events: `context-menu` carries what was under the pointer, and
+  // `update-target-url` the hovered link ('' when the pointer leaves it). Not
+  // in agent mode, where the page is agent-browser's dashboard, not the user's.
+  useEffect(() => {
+    const wv = webviewRef.current;
+    if (!wv) return;
+    const onTargetUrl = (e: any) => {
+      setHoverUrl(engineRef.current === 'agent' ? '' : linkStatusText(e?.url));
+    };
+    const clearHover = () => setHoverUrl('');
+    const onStartNavigation = (e: any) => { if (e?.isMainFrame !== false) clearHover(); };
+    const onContextMenu = (e: any) => {
+      if (engineRef.current === 'agent') return;
+      const params = e?.params ?? {};
+      const entries = buildBrowserContextMenu(params, { canGoBack: !!wv.canGoBack?.(), canGoForward: !!wv.canGoForward?.() });
+      const show = window.wmux?.browser?.showContextMenu;
+      if (!show) return;
+      show(labelBrowserMenu(entries, tRef.current)).then((action: Parameters<typeof runBrowserMenuAction>[0] | null) => {
+        if (!action || !mountedRef.current) return;
+        runBrowserMenuAction(action, {
+          linkURL: params.linkURL ?? '',
+          srcURL: params.srcURL ?? '',
+          x: params.x ?? 0,
+          y: params.y ?? 0,
+          webview: wv,
+          openInNewTab: (url) => {
+            if (onOpenInNewTabRef.current) onOpenInNewTabRef.current(url);
+            else openInNewBrowserTab(url);
+          },
+          openExternal: (url) => window.wmux?.system?.openExternal?.(url),
+          copyText: (text) => { window.wmux?.clipboard?.writeText?.(text)?.catch?.(() => {}); },
+        });
+      }).catch(() => {});
+    };
+    wv.addEventListener('update-target-url', onTargetUrl);
+    wv.addEventListener('context-menu', onContextMenu);
+    // A link the page navigated away from, or a pointer that left the pane
+    // without leaving the link, would otherwise leave a stale URL showing.
+    wv.addEventListener('did-start-navigation', onStartNavigation);
+    wv.addEventListener('mouseleave', clearHover);
+    return () => {
+      wv.removeEventListener('update-target-url', onTargetUrl);
+      wv.removeEventListener('context-menu', onContextMenu);
+      wv.removeEventListener('did-start-navigation', onStartNavigation);
+      wv.removeEventListener('mouseleave', clearHover);
     };
   }, []);
 
@@ -461,6 +657,21 @@ export default function BrowserPane({
     if (engineRef.current === 'agent') return;
     webviewRef.current?.executeJavaScript?.(popupBridgeSource()).catch(() => {});
   }, []);
+
+  // Clicking into the page focuses the pane (#388). See `onActivate`.
+  useEffect(() => {
+    const wv = webviewRef.current;
+    if (!wv) return;
+    const onFocus = () => activateRef.current?.();
+    wv.addEventListener('focus', onFocus);
+    return () => wv.removeEventListener('focus', onFocus);
+  }, []);
+
+  useEffect(() => {
+    if (focused !== false) return;
+    const wv = webviewRef.current;
+    if (wv && document.activeElement === wv) wv.blur();
+  }, [focused]);
 
   // Last automatic recovery, so a page that crashes on load can't be reloaded in
   // a tight loop. One retry per RECOVERY_COOLDOWN_MS; after that the pane stays
@@ -565,6 +776,10 @@ export default function BrowserPane({
     if (target) {
       setCurrentUrl(target);
       webviewRef.current?.loadURL(target).catch(() => {});
+    } else {
+      // Still on the page, as after cancelling the setup card, so no navigation
+      // will report its title.
+      onTitleChangeRef.current?.(explicitPageTitle(webviewRef.current?.getTitle?.() ?? '', showing));
     }
   }, [surfaceId]);
 
@@ -575,6 +790,20 @@ export default function BrowserPane({
     if (decision.action === 'enable') void enterAgentMode(decision.url);
     else if (decision.action === 'disable') void leaveAgentMode();
   }, [engine, enterAgentMode, leaveAgentMode]);
+
+  // The tab's label in agent mode. The webview's title is the dashboard's, and
+  // `url` stops updating, so the URL last read from the session is the only true
+  // answer. Leaving agent mode clears it, and the page's own title takes over.
+  const wasAgentRef = useRef(false);
+  useEffect(() => {
+    if (engine !== 'agent') {
+      if (wasAgentRef.current) onTitleChangeRef.current?.('');
+      wasAgentRef.current = false;
+      return;
+    }
+    wasAgentRef.current = true;
+    onTitleChangeRef.current?.(browserUrlLabel(agentUrl) ?? '');
+  }, [engine, agentUrl]);
 
   // ── keeping the address bar honest ────────────────────────────────────────
   //
@@ -643,6 +872,21 @@ export default function BrowserPane({
     return () => window.removeEventListener('wmux:browser-navigate', handler);
   }, [navigate, surfaceId]);
 
+  // Ctrl+click or middle-click on a link in this pane's page (main's
+  // webviewWindowOpenPolicy). Every pane hears it; only the one hosting that
+  // guest answers. Same destination as the right-click "Open link in new tab";
+  // with no pane to take the tab, the link opens here rather than nowhere.
+  useEffect(() => {
+    return window.wmux?.browser?.onOpenInNewTab?.((guestId: number, url: string) => {
+      const wv = webviewRef.current;
+      let ownId: number | undefined;
+      try { ownId = wv?.getWebContentsId?.(); } catch { return; } // not attached yet
+      if (ownId !== guestId || !isTabOpenableUrl(url)) return;
+      if (onOpenInNewTabRef.current) onOpenInNewTabRef.current(url, { background: true });
+      else if (!openInNewBrowserTab(url)) wv?.loadURL?.(url)?.catch?.(() => {});
+    });
+  }, []);
+
   const isAgent = engine === 'agent';
   const overlay = isAgent && (agentStatus === 'setup' || agentStatus === 'no-dashboard');
   /**
@@ -679,6 +923,7 @@ export default function BrowserPane({
         onReload={reload}
         onStop={stop}
         onDevTools={openDevTools}
+        onMoveToWorkspace={onMoveToWorkspace}
       />
       <div className="browser-pane__body">
         {/* @ts-ignore — webview is an Electron-specific HTML element */}
@@ -694,8 +939,9 @@ export default function BrowserPane({
           className="browser-pane__webview"
           // Hidden rather than unmounted: unmounting destroys the guest page and
           // its CDP registration, so the setup card would cost the user the tab
-          // they were on. Same reason keep-alive tabs use visibility.
-          style={overlay || isBlank ? { visibility: 'hidden' } : undefined}
+          // they were on. Same reason keep-alive tabs use visibility. A pane an
+          // agent drives keeps painting while hidden: see webviewHiding.
+          {...webviewHiding({ overlay, isBlank, isAgent, visible, keepRendering })}
         />
         {isBlank && !overlay && (
           <div className="browser-pane__blank">
@@ -717,6 +963,11 @@ export default function BrowserPane({
             onRetry={() => void enterAgentMode(agentUrlRef.current)}
             onCancel={() => onEngineChange?.('web')}
           />
+        )}
+        {hoverUrl && !isAgent && !overlay && (
+          // Chrome's bottom-left link readout (#439). Absolute over the page and
+          // click-through, so it never moves or covers what it describes.
+          <div className="browser-pane__link-status" aria-hidden="true">{hoverUrl}</div>
         )}
       </div>
     </div>

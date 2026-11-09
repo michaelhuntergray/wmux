@@ -8,15 +8,23 @@ import { resolveAnchorPane, resolveLayoutSize } from './store/agent-layout-targe
 import { surfaceTerminalRegistry, showPaneNotice } from './hooks/useTerminal';
 import { rollupAgents } from './store/agent-rollup';
 import { toRemoteRosterSource } from './utils/remote-roster';
-import { PaneId, SurfaceId, WorkspaceId, SurfaceType, engineOf, type BrowserEngine, type WorkspaceLayout } from '../shared/types';
+import { selectWorkspaceLabels } from './components/SplitPane/use-osc-title';
+import { openLinkFromBridge } from './utils/open-link';
+import { readScreenReport } from './utils/screen-report';
+import { grantKeepRendering } from './utils/browser-keep-rendering';
+import { PaneId, SurfaceId, WorkspaceId, SurfaceType, engineOf, type BrowserEngine, type WorkspaceLayout, type WorktreeMetadata } from '../shared/types';
 import { promptSummary, type PromptEntry, type PromptSource } from './store/prompt-slice';
 import { v4 as uuid } from 'uuid';
 import { buildManifestTree, describeWorkspaceTree, type ManifestWorkspaceSpec } from './store/manifest-tree';
 import { translate, type TranslationKey } from './i18n/core';
+import { isPosixPath } from '../shared/paths';
 
 /** Non-hook context (bridges the main process to the store) — reads the current language directly. */
 const bridgeT = (key: TranslationKey, fallback?: string): string =>
   translate(useStore.getState().language, key, fallback);
+
+/** Notices main may ask for by key (`__wmux_paneNoticeKey`). */
+const PANE_NOTICE_KEYS = ['worktree.restoreMissing'] as const;
 
 const WIRE_LAYOUTS: readonly WorkspaceLayout[] = ['grid', 'columns', 'rows', 'left', 'down'];
 
@@ -82,15 +90,40 @@ const publicPrompt = (entry: PromptEntry): PublicPrompt => ({
   summary: promptSummary(entry.text),
 });
 
+async function createWorktreeFor(
+  dir: string | undefined,
+  branch: string,
+  base: string | undefined,
+): Promise<WorktreeMetadata> {
+  if (!dir) throw new Error('Cannot tell which repository to branch from: pass --cwd <dir>');
+  const probe = await window.wmux?.worktree?.probe(dir);
+  if (!probe?.repoRoot) throw new Error(`Directory is not inside a git repository: ${dir}`);
+  const created = await window.wmux?.worktree?.create(probe.repoRoot, branch, base);
+  if (!created?.ok || !created.worktree) throw new Error(created?.error || 'Failed to create worktree');
+  return created.worktree as WorktreeMetadata;
+}
+
 export function initPipeBridge(): void {
   const w = window as any;
 
   // ─── Workspace ──────────────────────────────────────────────────────────────
 
-  w.__wmux_createWorkspace = (params?: {
+  w.__wmux_createWorkspace = async (params?: {
     title?: string; shell?: string; cwd?: string; panes?: number; layout?: string;
+    worktree?: string; base?: string;
   }) => {
     const store = useStore.getState();
+    let worktreeMeta: WorktreeMetadata | undefined;
+    let targetCwd = params?.cwd;
+
+    // `--worktree` (#366): the repository is the CALLER's directory, which main
+    // has already put in `cwd` (an explicit --cwd, or the calling surface's
+    // reported folder). Never the focused workspace's — that guess is #246.
+    if (params?.worktree) {
+      worktreeMeta = await createWorktreeFor(params.cwd, params.worktree, params.base);
+      targetCwd = worktreeMeta.worktreePath;
+    }
+
     // `--panes` / `--layout` (issue #212) build a tree HERE rather than being
     // passed through to createWorkspace, because a caller-supplied splitTree is
     // exactly what createWorkspace already accepts — and going through
@@ -103,9 +136,13 @@ export function initPipeBridge(): void {
     const shape = resolveWireLayout(params, store.workspacePrefs);
     const splitTree = wants ? buildWorkspaceTree(shape.panes, shape.layout) : undefined;
     const id = store.createWorkspace({
-      title: params?.title,
-      shell: params?.shell,
-      cwd: params?.cwd,
+      title: params?.title ?? worktreeMeta?.branch,
+      // A POSIX folder only exists inside WSL. Since #397 a Windows pane never
+      // takes a POSIX workspace cwd, so a workspace asked for on one (an agent
+      // inside WSL passing $PWD) opens WSL panes unless a shell was named.
+      shell: params?.shell || (targetCwd && isPosixPath(targetCwd) ? 'wsl.exe' : undefined),
+      cwd: targetCwd,
+      worktree: worktreeMeta,
       ...(splitTree ? { splitTree } : {}),
     }, bridgeT);
     return { workspaceId: id };
@@ -226,6 +263,17 @@ export function initPipeBridge(): void {
       }
     }
     return false;
+  };
+
+  /**
+   * An agent just drove this browser surface: keep it painting for `ms` even
+   * while it is hidden (utils/browser-keep-rendering.ts). Answers true so main
+   * knows the lease was taken; any id is accepted, because the browser panel's
+   * `browser-<workspace>` surfaces are not in the split tree.
+   */
+  w.__wmux_keepBrowserRendering = (surfaceId: string, ms: number): boolean => {
+    grantKeepRendering(surfaceId, ms);
+    return true;
   };
 
   // ─── Pane ───────────────────────────────────────────────────────────────────
@@ -534,6 +582,14 @@ export function initPipeBridge(): void {
     return null;
   };
 
+  /**
+   * A URL an agent or CLI asked wmux to open (`link.open` -> `wmux open`).
+   *
+   * Goes through the same destination rule as a terminal link click, so
+   * `browserPrefs.openLinksExternally` still owns panel-vs-system.
+   */
+  w.__wmux_openLink = openLinkFromBridge;
+
   // ─── Workspace manifests (#284) ─────────────────────────────────────────────
   // Main owns the whole open flow (parse, trust, ordering, typing commands);
   // these only touch the store. No startupCommands cross this boundary — see
@@ -567,6 +623,16 @@ export function initPipeBridge(): void {
     return true;
   };
 
+  /**
+   * The same notice, named by i18n KEY so main never writes English into a
+   * pane (#366: a restored worktree workspace whose folder is gone). Only the
+   * keys listed here are accepted; anything else is refused, not echoed.
+   */
+  w.__wmux_paneNoticeKey = (surfaceId: string, key: string) => {
+    if (!(PANE_NOTICE_KEYS as readonly string[]).includes(key)) return false;
+    return w.__wmux_paneNotice(surfaceId, bridgeT(key as TranslationKey));
+  };
+
   /** The caller's workspace as `wmux workspace save` writes it; null if not here. */
   w.__wmux_describeWorkspace = (params: { caller?: string; workspaceId?: string }) => {
     const store = useStore.getState();
@@ -592,26 +658,18 @@ export function initPipeBridge(): void {
     return leaf.surfaces[idx]?.id || null;
   };
 
-  // Read a terminal's screen as plain text (surface.read_text / read-screen).
-  // Reads the ACTIVE xterm buffer — alt buffer included, so a full-screen TUI
-  // returns what is actually visible. `lines` counts back from the bottom of
-  // the buffer (scrollback included); trailing blank lines are trimmed.
-  w.__wmux_readScreen = (surfaceId?: string, lines?: number) => {
+  // Read a terminal's screen (surface.read_text / read-screen): the text of the
+  // ACTIVE buffer plus which buffer it is, its size and the cursor, and with
+  // `events` the surface's recent buffer switches and resizes. See
+  // utils/screen-report.ts.
+  w.__wmux_readScreen = (surfaceId?: string, lines?: number, events?: boolean) => {
     const id = surfaceId || w.__wmux_getActiveSurfaceId?.();
     if (!id) return { error: 'No active surface' };
     const terminal = surfaceTerminalRegistry.get(id);
     if (!terminal) {
       return { error: `no terminal for surface ${id} (markdown/browser pane, another window, or closed)` };
     }
-    const buf = terminal.buffer.active;
-    const count = Math.min(Math.max(Math.floor(lines ?? 50), 1), 10000);
-    const end = buf.length;
-    const out: string[] = [];
-    for (let i = Math.max(0, end - count); i < end; i++) {
-      out.push(buf.getLine(i)?.translateToString(true) ?? '');
-    }
-    while (out.length && out[out.length - 1] === '') out.pop();
-    return { text: out.join('\n'), lines: out.length, surfaceId: id };
+    return readScreenReport(terminal, id, { lines: lines ?? 50, events: events === true });
   };
 
   /**
@@ -710,10 +768,14 @@ export function initPipeBridge(): void {
   // #235/#253 hold there too), mapped field by field to RemoteRosterSource so
   // metadata, detectedState, paneId and every choice's key/text stay here.
   // Pulled by main on its own cadence while a phone is connected; nothing
-  // subscribes to the store for it.
+  // subscribes to the store for it. Workspaces carry the sidebar's labels, so
+  // the phone names them as the desktop does (#343); the CLI's answers above
+  // keep the stored title.
   w.__wmux_remoteRoster = () => {
     const s = useStore.getState();
-    return rollupAgents(s.workspaces, s.agentStates, Date.now(), s.agentIdentities, s.agentDetections)
-      .roster.map(toRemoteRosterSource);
+    return rollupAgents(
+      s.workspaces, s.agentStates, Date.now(), s.agentIdentities, s.agentDetections,
+      selectWorkspaceLabels(s, s.workspaces),
+    ).roster.map(toRemoteRosterSource);
   };
 }

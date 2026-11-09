@@ -1,48 +1,39 @@
+/**
+ * Claude Code integration: injects wmux's instructions into
+ * `~/.claude/CLAUDE.md`, configures hooks in `~/.claude/settings.json`, and
+ * points chrome-devtools-mcp at the browser panel — and, since 0.40.0, the
+ * inverse of each (issue #132).
+ *
+ * Since #386 the instructions are a SKILL, `~/.claude/skills/wmux/SKILL.md`,
+ * built by `buildSkillFile` from the same `readRenderedInstructions` text, and
+ * CLAUDE.md keeps only `buildContextStub`: the `wmux ping` check, the moments
+ * to load the skill, and the SKILL.md's absolute path for readers that load
+ * CLAUDE.md but not skills (Grok compat). The stub replaces the full block ONLY
+ * when the skill is on disk and carries `SKILL_OWNER_MARKER`; a user's own
+ * `skills/wmux` is never touched and keeps the full block inline. Other agents
+ * (OpenCode, Kiro, pi, omp, Qwen) still get the full block.
+ *
+ * Two things it no longer does, both because they were writing into files on
+ * terms Claude Code does not use, and both now only taken back:
+ *
+ *  - the orchestrator plugin, DEPRECATED and uninstall-only (#239) — see
+ *    `removeOrchestratorPlugin` below;
+ *  - the `chrome-devtools` MCP entry in `~/.claude/settings.json`, which goes
+ *    to `~/.claude.json` instead (#237) — see `getClaudeConfigPath` below.
+ */
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { readRenderedClaudePointer, readRenderedInstructions } from './agent-instructions';
+import {
+  SKILL_OWNER_MARKER,
+  buildContextStub,
+  buildSkillFile,
+  getCliBinDirForInstructions,
+  readRenderedInstructions,
+} from './agent-instructions';
 
 const START_MARKER = '<!-- wmux:start';
 const END_MARKER = '<!-- wmux:end -->';
-const SKILL_MANAGED_LINE = '<!-- AUTO-MANAGED BY wmux. Edits are overwritten on launch. -->';
-
-function getWmuxSkillPath(): string {
-  return path.join(os.homedir(), '.claude', 'skills', 'wmux', 'SKILL.md');
-}
-
-function ensureWmuxSkill(renderedBlock: string): void {
-  const skillPath = getWmuxSkillPath();
-  const body = renderedBlock.split(/\r?\n/).filter((line) => !line.startsWith(START_MARKER) && line !== END_MARKER).join('\n').trim();
-  const content = [
-    '---',
-    'name: wmux',
-    'description: Use when `wmux ping` answers pong to drive the browser panel, markdown view, report-agent (Needs-you prompts), and report-subagent.',
-    '---',
-    SKILL_MANAGED_LINE,
-    '',
-    body,
-    '',
-  ].join('\n');
-  if (fs.existsSync(skillPath)) {
-    const current = fs.readFileSync(skillPath, 'utf-8');
-    if (!current.includes(SKILL_MANAGED_LINE)) {
-      console.warn('[wmux] Leaving user-owned ~/.claude/skills/wmux/SKILL.md untouched');
-      return;
-    }
-    if (current === content) return;
-  }
-  fs.mkdirSync(path.dirname(skillPath), { recursive: true });
-  fs.writeFileSync(skillPath, content, 'utf-8');
-}
-
-function removeWmuxSkill(): void {
-  const skillPath = getWmuxSkillPath();
-  if (!fs.existsSync(skillPath)) return;
-  if (!fs.readFileSync(skillPath, 'utf-8').includes(SKILL_MANAGED_LINE)) return;
-  fs.unlinkSync(skillPath);
-  if (fs.readdirSync(path.dirname(skillPath)).length === 0) fs.rmdirSync(path.dirname(skillPath));
-}
 
 
 export function getClaudeMdPath(): string {
@@ -153,8 +144,7 @@ function collapse(text: string): string {
 }
 
 /**
- * Ensures the user's global ~/.claude/CLAUDE.md contains the wmux pointer and
- * ~/.claude/skills/wmux/SKILL.md contains the full rendered instructions.
+ * Ensures the user's global ~/.claude/CLAUDE.md contains the wmux section.
  * - Creates ~/.claude/ and CLAUDE.md if they don't exist
  * - Inserts the wmux block if not present
  * - Updates the wmux block if it's outdated
@@ -166,10 +156,15 @@ export function ensureClaudeContext(): void {
     // Rendered rather than read: the block carries this install's absolute CLI
     // path, so a session that wmux did not spawn (and therefore has no `wmux`
     // on PATH) can still tell "not running" from "not reachable" — issue #158.
-    const wmuxBlock = readRenderedClaudePointer();
     const fullBlock = readRenderedInstructions();
-    if (wmuxBlock === null || fullBlock === null) return;
-    ensureWmuxSkill(fullBlock);
+    if (fullBlock === null) return;
+    // The skill holds the guidance and CLAUDE.md keeps a stub (issue #386) —
+    // but only once the skill is really on disk and really ours. Otherwise the
+    // full block stays inline, as before: a stub pointing at nothing is worse
+    // than the 118 lines it replaced.
+    const wmuxBlock = ensureClaudeSkill(fullBlock)
+      ? buildContextStub(getCliBinDirForInstructions(), getClaudeSkillPath())
+      : fullBlock;
     const claudeMdPath = getClaudeMdPath();
     const claudeDir = path.dirname(claudeMdPath);
 
@@ -220,12 +215,7 @@ export function ensureClaudeContext(): void {
 
     const before = existing.substring(0, startIdx);
     const after = existing.substring(endIdx + END_MARKER.length);
-    // trimEnd: the tail already supplies the newline. Keeping the block's own
-    // leaves three newlines, which stripLegacyBlocks collapses on the next launch,
-    // so every launch rewrote the file (see injectWmuxBlock).
-    const next = before + wmuxBlock.trimEnd() + after;
-    if (next === raw) return;
-    fs.writeFileSync(claudeMdPath, next, 'utf-8');
+    fs.writeFileSync(claudeMdPath, before + wmuxBlock + after, 'utf-8');
     console.log('[wmux] Updated wmux context in ~/.claude/CLAUDE.md');
   } catch (err) {
     console.warn('[wmux] Failed to update Claude context:', err);
@@ -263,8 +253,8 @@ export function stripWmuxBlock(content: string): string | null {
  * for.
  */
 export function removeClaudeContext(): void {
+  removeClaudeSkill();
   try {
-    removeWmuxSkill();
     const claudeMdPath = getClaudeMdPath();
     if (!fs.existsSync(claudeMdPath)) return;
     const stripped = stripWmuxBlock(fs.readFileSync(claudeMdPath, 'utf-8'));
@@ -274,6 +264,50 @@ export function removeClaudeContext(): void {
     console.log('[wmux] Removed wmux context from ~/.claude/CLAUDE.md');
   } catch (err) {
     console.warn('[wmux] Failed to remove Claude context:', err);
+  }
+}
+
+export function getClaudeSkillPath(): string {
+  return path.join(os.homedir(), '.claude', 'skills', 'wmux', 'SKILL.md');
+}
+
+const isOurSkill = (content: string): boolean => content.includes(SKILL_OWNER_MARKER);
+
+/**
+ * Write wmux's guidance as `~/.claude/skills/wmux/SKILL.md` (issue #386).
+ * Returns whether the skill on disk is now ours and current. A SKILL.md there
+ * without our marker is the user's own skill of the same name: it is left
+ * exactly as it is, and the caller falls back to the inline block.
+ */
+export function ensureClaudeSkill(renderedBlock: string): boolean {
+  try {
+    const skillPath = getClaudeSkillPath();
+    const wanted = buildSkillFile(renderedBlock);
+    if (fs.existsSync(skillPath)) {
+      const current = fs.readFileSync(skillPath, 'utf-8');
+      if (!isOurSkill(current)) return false;
+      if (current === wanted) return true;
+    }
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, wanted, 'utf-8');
+    return true;
+  } catch (err) {
+    console.warn('[wmux] Failed to write the wmux skill:', err);
+    return false;
+  }
+}
+
+/** The inverse: our SKILL.md, then its folder if nothing else is in it. */
+export function removeClaudeSkill(): void {
+  try {
+    const skillPath = getClaudeSkillPath();
+    if (!fs.existsSync(skillPath) || !isOurSkill(fs.readFileSync(skillPath, 'utf-8'))) return;
+    fs.unlinkSync(skillPath);
+    const dir = path.dirname(skillPath);
+    if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+    console.log('[wmux] Removed the wmux skill from ~/.claude/skills');
+  } catch (err) {
+    console.warn('[wmux] Failed to remove the wmux skill:', err);
   }
 }
 
@@ -357,9 +391,6 @@ export function removeWmuxHooks(settings: any): any {
  * the fs (issue #53).
  */
 export function applyWmuxHooks(settings: any, hookScript: string): any {
-  const next = { ...(settings || {}) };
-  next.hooks = { ...(next.hooks || {}) };
-
   // PostToolUse passes the tool name as a positional arg; Notification/Stop
   // pass an --event flag so the helper reports an event type instead.
   //
@@ -371,15 +402,43 @@ export function applyWmuxHooks(settings: any, hookScript: string): any {
   // `C:\dev\null` and every hook fails with exit 1. Claude Code on Windows
   // may still use Git Bash, so a PowerShell-only spelling (`2>$null`) is
   // equally wrong. No redirect is valid in bash, cmd and pwsh.
-  const makeToolCmd = (tool: string) => `node "${hookScript}" ${tool}`;
-  const makeEventCmd = (event: string) => wmuxEventHookCommand(hookScript, event);
+  return applyWmuxHookCommands(settings, {
+    tool: (tool) => `node "${hookScript}" ${tool}`,
+    event: (event) => wmuxEventHookCommand(hookScript, event),
+  });
+}
+
+/**
+ * How a wmux hook entry's command is spelled: one per tracked tool
+ * (PostToolUse) and one per lifecycle event. Every spelling must contain
+ * {@link HOOK_MARKER}, which is how {@link removeWmuxHooks} recognises wmux's
+ * entries and therefore how they are ever taken back.
+ */
+export interface WmuxHookCommands {
+  tool: (tool: string) => string;
+  event: (event: string) => string;
+}
+
+/**
+ * {@link applyWmuxHooks} with the command spelling left to the caller. The
+ * entries, their events, matchers and `async` flags are the same on every host;
+ * only how the helper is started differs. A WSL distro starts it through
+ * interop (wsl-claude-hooks.ts, #428).
+ */
+export function applyWmuxHookCommands(settings: any, commands: WmuxHookCommands): any {
+  const next = { ...(settings || {}) };
+  next.hooks = { ...(next.hooks || {}) };
+  const makeToolCmd = commands.tool;
+  const makeEventCmd = commands.event;
 
   // The per-tool-call hooks run in the BACKGROUND. Every wmux hook is a pure
   // observer: it reports to the pipe and never blocks a tool or injects
   // context, so there is nothing for Claude Code to wait on — and it did wait,
   // a measured 125-145 ms per hook process (Git Bash wrapper + node boot + the
   // pipe round trip) on the critical path of EVERY tool call. `async: true` is
-  // honoured since Claude Code 2.1.x; older versions ignore the field.
+  // honoured since Claude Code 2.1.x; older versions ignore the field. This
+  // function rewrites wmux's own entries on every launch, so an install that
+  // predates the flag picks it up without a migration.
   //
   // Ordering is not a concern: each report carries the wall-clock it fired at,
   // and agent-state.ts drops a report older than the one it already accepted,

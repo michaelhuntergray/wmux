@@ -131,7 +131,8 @@ export function appIconCandidates(): string[] {
       ];
 }
 
-function getAppIcon(): Electron.NativeImage | undefined {
+/** Exported for the tray icon (#442), so the window and the tray load the same file. */
+export function getAppIcon(): Electron.NativeImage | undefined {
   try {
     for (const candidate of appIconCandidates()) {
       const image = nativeImage.createFromPath(candidate);
@@ -181,6 +182,8 @@ interface WindowEntry {
    * and which need a restart.
    */
   transparent: boolean;
+  /** Applied backdrop; null if a failed native change may have partly applied. */
+  backdrop: { enabled: boolean; material: WindowMaterial } | null;
   /** A close-confirm dialog is on screen for this window (issue #227). */
   closePending: boolean;
   /** The user answered that dialog with "close"; the re-issued close goes through. */
@@ -199,6 +202,13 @@ export interface CloseGuardDeps {
   enabled: () => boolean;
   bypass: () => boolean;
   ptyCount: () => number;
+  /** The `closeToTray` pref (#442), read at close time. */
+  toTray: () => boolean;
+  /**
+   * Put the tray icon up before a window hides (#442). False means no icon
+   * could be shown, and the close is then decided as if the pref were off.
+   */
+  ensureTray: () => boolean;
 }
 
 export class WindowManager {
@@ -220,6 +230,12 @@ export class WindowManager {
    * state into session.json before the renderer dies — or null to close now.
    */
   beforeClose: ((win: BrowserWindow, isLastWindow: boolean) => Promise<unknown> | null) | null = null;
+
+  /**
+   * Notified when a window is shown or closed (#442), so index.ts can take the
+   * tray icon down once no window is hidden to it any more.
+   */
+  onVisibilityChanged: (() => void) | null = null;
 
   createWindow(
     bounds?: { x: number; y: number; width: number; height: number },
@@ -305,9 +321,15 @@ export class WindowManager {
     win.on('closed', () => {
       this.windows.delete(id);
       this.onWindowClosed?.(id, webContentsId);
+      this.onVisibilityChanged?.();
     });
+    win.on('show', () => this.onVisibilityChanged?.());
 
-    const entry: WindowEntry = { id, window: win, transparent, closePending: false, closeConfirmed: false, sessionFlushed: false };
+    const entry: WindowEntry = {
+      id, window: win, transparent,
+      backdrop: { enabled: translucent, material: backdrop.material },
+      closePending: false, closeConfirmed: false, sessionFlushed: false,
+    };
     // Every route to a window close lands here — the caption ×, Alt+F4, the
     // renderer's closeWindow shortcut (`window.close()`), the frameless
     // caption's closeSelf — so this is the one place the guard can sit.
@@ -327,18 +349,31 @@ export class WindowManager {
    */
   private guardClose(entry: WindowEntry, event: Electron.Event): void {
     const guard = this.closeGuard;
-    const decision = decideClose({
+    const input = {
       enabled: guard?.enabled() ?? false,
       bypass: guard?.bypass() ?? true,
       confirmed: entry.closeConfirmed,
       pending: entry.closePending,
-    });
+      toTray: guard?.toTray() ?? false,
+      lastVisibleWindow: !this.getAllWindows().some(e => e !== entry && e.window.isVisible()),
+    };
+    let decision = decideClose(input);
+    // No tray icon, no hiding: the window would be unreachable (#442).
+    if (decision === 'hide' && !(guard?.ensureTray() ?? false)) {
+      decision = decideClose({ ...input, toTray: false });
+    }
     if (decision === 'allow') {
       this.flushBeforeClose(entry, event);
       return;
     }
     event.preventDefault();
     if (decision === 'swallow') return;
+    if (decision === 'hide') {
+      // Nothing ends: the renderer keeps running hidden, the PTYs live in main,
+      // and the 30 s auto-save goes on asking this window for its state.
+      entry.window.hide();
+      return;
+    }
 
     entry.closePending = true;
     const copy = closeDialogCopy({
@@ -400,6 +435,9 @@ export class WindowManager {
           if (kind === 'unresponsive') win.webContents.forcefullyCrashRenderer();
           win.webContents.reload();
         } else if (kind === 'gone') {
+          // The user just answered "close" in a main-process dialog: neither
+          // ask again (#227) nor hide a dead renderer to the tray (#442).
+          entry.closeConfirmed = true;
           win.close();
         }
       }, () => {
@@ -465,6 +503,25 @@ export class WindowManager {
     if (entry && !entry.window.isDestroyed()) {
       entry.window.focus();
     }
+  }
+
+  /**
+   * Bring back every window hidden to the tray (#442) and focus one of them.
+   * False when none was hidden, so a caller can fall back to its own focus.
+   */
+  showHiddenWindows(): boolean {
+    const hidden = this.getAllWindows().filter(e => !e.window.isVisible());
+    for (const e of hidden) e.window.show();
+    const target = hidden.at(-1)?.window;
+    if (!target) return false;
+    if (target.isMinimized()) target.restore();
+    target.focus();
+    return true;
+  }
+
+  /** Any wmux window currently hidden to the tray (#442). */
+  hasHiddenWindows(): boolean {
+    return this.getAllWindows().some(e => !e.window.isVisible());
   }
 
   getWindow(id: WindowId): BrowserWindow | undefined {
@@ -557,20 +614,31 @@ export class WindowManager {
       // setBackgroundColor re-lands an opaque surface. Nothing to apply — the
       // opacity itself is a renderer-side alpha, not a window property.
       if (wantsTransparent) continue;
-      applyOpaqueBackdrop(entry.window, enabled, material);
+      // The renderer reasserts its prefs on mount. On Win11 even setting an
+      // already-disabled material to 'none' rebuilds native transparency and
+      // can flash the whole window white, despite ready-to-show and dark CSS.
+      // Skip unchanged native state; a disabled backdrop ignores its material.
+      if (entry.backdrop && entry.backdrop.enabled === enabled &&
+          (!enabled || entry.backdrop.material === material)) continue;
+      entry.backdrop = applyOpaqueBackdrop(entry.window, enabled, material)
+        ? { enabled, material }
+        : null;
     }
     return { needsRestart };
   }
 }
 
 /** The live half of setBackdrop, for a window built with an opaque backing. */
-function applyOpaqueBackdrop(win: BrowserWindow, enabled: boolean, material: WindowMaterial): void {
+function applyOpaqueBackdrop(win: BrowserWindow, enabled: boolean, material: WindowMaterial): boolean {
   try {
     win.setBackgroundColor(enabled ? TRANSPARENT_BG : OPAQUE_BG);
     if (supportsBackdropMaterial()) {
       win.setBackgroundMaterial(enabled && material !== 'clear' ? material : 'none');
     }
+    return true;
   } catch {
-    // Window went away mid-loop, or the platform rejected the material.
+    // Window went away mid-loop, or the platform rejected the material. The
+    // caller invalidates its cache: even returning to the old state must retry.
+    return false;
   }
 }

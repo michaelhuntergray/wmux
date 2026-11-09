@@ -67,6 +67,10 @@ describe('bindingFromEvent', () => {
     }
   });
 
+  it('does not capture an empty key as an unbind operation', () => {
+    expect(bindingFromEvent({ key: '', ctrlKey: false, shiftKey: false, altKey: false })).toBeNull();
+  });
+
   it('builds a binding from a real key, omitting absent modifiers rather than false-ing them', () => {
     const binding = bindingFromEvent({ key: 'n', ctrlKey: true, shiftKey: false, altKey: false });
     expect(binding).toEqual({ key: 'n', ctrl: true, shift: undefined, alt: undefined });
@@ -145,6 +149,15 @@ describe('claimsKeyEvent', () => {
     expect(claims(key('f', { ctrl: true }))).toBe(true); // find (PaneWrapper)
   });
 
+  it('passes cleared bindings through to the terminal while retaining other shortcuts', () => {
+    const shortcuts = { ...DEFAULT_SHORTCUTS, splitRight: { key: '' }, find: { key: '' }, toggleShortcutCheatSheet: { key: '' } };
+    expect(claimsKeyEvent(key('d', { ctrl: true }), shortcuts, DEFAULT_KEYBOARD_PREFS)).toBe(false);
+    expect(claimsKeyEvent(key('f', { ctrl: true }), shortcuts, DEFAULT_KEYBOARD_PREFS)).toBe(false);
+    expect(claimsKeyEvent(key('F1'), shortcuts, DEFAULT_KEYBOARD_PREFS)).toBe(false);
+    expect(claimsKeyEvent(key(''), shortcuts, DEFAULT_KEYBOARD_PREFS)).toBe(false);
+    expect(claimsKeyEvent(key('n', { ctrl: true }), shortcuts, DEFAULT_KEYBOARD_PREFS)).toBe(true);
+  });
+
   it('claims the combo that always worked, unchanged', () => {
     expect(claims(key('P', { ctrl: true, shift: true }))).toBe(true); // commandPalette
   });
@@ -181,7 +194,7 @@ describe('claimsKeyEvent', () => {
   });
 
   it('still ignores function keys that are NOT bound', () => {
-    expect(claims(key('F5'))).toBe(false);
+    expect(claims(key('F5'))).toBe(true);
     expect(claims(key('F7'))).toBe(false);
   });
 

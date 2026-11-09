@@ -11,9 +11,10 @@
 //
 // Three things about the editing path are load-bearing:
 //
-//   • The editor is a plain <textarea>, not CodeMirror or Monaco. The renderer
-//     bundle is already ~1.8 MB and an editor dependency roughly doubles it, to
-//     serve "edit a thing or two in a file". If syntax-highlighted editing is
+//   • The editor is a plain <textarea>, not CodeMirror or Monaco. The desktop
+//     renderer already loads ~2 MB of JS (index-*.js plus the chunk it shares
+//     with the phone UI) and an editor dependency roughly doubles it, to serve
+//     "edit a thing or two in a file". If syntax-highlighted editing is
 //     ever wanted, that is the moment to pay for it — not before.
 //
 //   • A textarea normalizes its value to LF. The CRLF a file arrived with is
@@ -35,8 +36,9 @@ import { useStore } from '../../store';
 import { useT } from '../../i18n';
 import { SOURCE_VIRTUALIZE_THRESHOLD } from '../Markdown/markdown-utils';
 import { codeErrorKey } from '../Explorer/explorer-errors';
+import { findSurfaceOwner } from '../../store/split-utils';
 import type {
-  ExplorerErrorCode, PaneId, SplitNode, SurfaceId, SurfaceRef, WorkspaceId,
+  ExplorerErrorCode, SplitNode, SurfaceId, SurfaceRef,
 } from '../../../shared/types';
 import '../../styles/code.css';
 
@@ -82,6 +84,7 @@ export function CodePane({ surfaceId }: { surfaceId: SurfaceId }): React.JSX.Ele
   const content = surface?.codeContent;
   const [error, setError] = useState<ExplorerErrorCode | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshToken, setRefreshToken] = useState(0);
 
   // ─── Editing state ─────────────────────────────────────────────────────────
   // `draft === null` IS the read-only mode. Not a boolean beside the text: two
@@ -112,7 +115,7 @@ export function CodePane({ surfaceId }: { surfaceId: SurfaceId }): React.JSX.Ele
     // A tab that had failed (binary, too large, deleted) then went on showing
     // that failure over the next file's perfectly good content, because the
     // render checks `error` before it checks `content`.
-    if (content !== undefined) { setError(null); return; }
+    if (content !== undefined && refreshToken === 0) { setError(null); return; }
     if (!relPath || !rootSurfaceId) { setError('invalid_path'); return; }
     if (!rootCwd) return;                   // root not reported yet — see above
     let cancelled = false;
@@ -141,6 +144,7 @@ export function CodePane({ surfaceId }: { surfaceId: SurfaceId }): React.JSX.Ele
         // that produced the buffer, so a save compares against the state of the
         // file the user was actually looking at.
         mtimeRef.current = res.mtimeMs;
+        setRefreshToken(0);
         updateSurfaceContent(res.content);
       },
       () => { if (!cancelled) { setLoading(false); setError('read_failed'); } },
@@ -151,11 +155,20 @@ export function CodePane({ surfaceId }: { surfaceId: SurfaceId }): React.JSX.Ele
       // Re-resolved from the LIVE state rather than closed over: the surface
       // may have been dragged to another pane while the read was in flight,
       // and updateSurface addresses a surface by (workspace, pane, surface).
-      const owner = findOwner(useStore.getState().workspaces, surfaceId);
+      const owner = findSurfaceOwner(useStore.getState().workspaces, surfaceId);
       if (!owner) return;
       updateSurface(owner.workspaceId, owner.paneId, surfaceId, { codeContent: text });
     }
-  }, [surfaceId, rootSurfaceId, rootCwd, relPath, filePath, content, updateSurface]);
+  }, [surfaceId, rootSurfaceId, rootCwd, relPath, filePath, content, updateSurface, refreshToken]);
+
+  useEffect(() => {
+    const onRefresh = (event: Event) => {
+      const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
+      if (id === surfaceId) setRefreshToken((n) => n + 1);
+    };
+    document.addEventListener('wmux:refresh-surface', onRefresh);
+    return () => document.removeEventListener('wmux:refresh-surface', onRefresh);
+  }, [surfaceId]);
 
   // Write the buffer and the dirty flag into the store together.
   //
@@ -166,7 +179,7 @@ export function CodePane({ surfaceId }: { surfaceId: SurfaceId }): React.JSX.Ele
   // matters more than it looks: without it, clicking another file in the tree
   // would silently reuse THIS pane and discard the edit in progress.
   const commit = useCallback((patch: { codeContent?: string; markdownDirty?: boolean }) => {
-    const owner = findOwner(useStore.getState().workspaces, surfaceId);
+    const owner = findSurfaceOwner(useStore.getState().workspaces, surfaceId);
     if (!owner) return;
     updateSurface(owner.workspaceId, owner.paneId, surfaceId, patch);
   }, [surfaceId, updateSurface]);
@@ -390,35 +403,11 @@ export function samePath(a: string, b: string): boolean {
   return norm(a) === norm(b);
 }
 
-// ─── Tree lookups ────────────────────────────────────────────────────────────
-// split-utils exports findLeaf (by paneId) and getAllPaneIds, neither of which
-// answers "which surface/pane/workspace is this surfaceId in?". These two do,
-// and they live here rather than in split-utils because this is their only
-// caller — moving them there when a second one appears is the cheaper direction.
-
 function findSurface(tree: SplitNode, surfaceId: SurfaceId): SurfaceRef | null {
   if (tree.type === 'leaf') {
     return tree.surfaces.find((s) => s.id === surfaceId) ?? null;
   }
   return findSurface(tree.children[0], surfaceId) ?? findSurface(tree.children[1], surfaceId);
-}
-
-function findPane(tree: SplitNode, surfaceId: SurfaceId): PaneId | null {
-  if (tree.type === 'leaf') {
-    return tree.surfaces.some((s) => s.id === surfaceId) ? tree.paneId : null;
-  }
-  return findPane(tree.children[0], surfaceId) ?? findPane(tree.children[1], surfaceId);
-}
-
-function findOwner(
-  workspaces: { id: WorkspaceId; splitTree: SplitNode }[],
-  surfaceId: SurfaceId,
-): { workspaceId: WorkspaceId; paneId: PaneId } | null {
-  for (const ws of workspaces) {
-    const paneId = findPane(ws.splitTree, surfaceId);
-    if (paneId) return { workspaceId: ws.id, paneId };
-  }
-  return null;
 }
 
 export default CodePane;

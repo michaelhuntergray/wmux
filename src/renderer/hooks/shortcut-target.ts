@@ -33,6 +33,7 @@ export const GLOBAL_IN_EDITOR: ReadonlySet<ShortcutAction> = new Set<ShortcutAct
   // user editing a code or markdown tab is standing when they reach for it.
   'nextSurface',
   'prevSurface',
+  'refreshSurface',
 ]);
 
 /** The subset of an event target this guard needs; keeps the tests DOM-free. */
@@ -57,3 +58,42 @@ export function isEditableTarget(target: EditableTargetLike | null | undefined):
   const tag = target.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!target.isContentEditable;
 }
+
+/**
+ * Actions a held chord must run once, not once per auto-repeat keydown.
+ *
+ * Most bindings want the repeat (resizing a pane, stepping the font size), so
+ * this is opt-in. Reset terminal state is in it because a second press within
+ * a few seconds of one that kept the alternate screen forces it off (#357),
+ * and Windows starts repeating a held key well inside that window: holding
+ * Ctrl+Shift+R would force a live program off its screen, which is #347.
+ */
+export const IGNORES_KEY_REPEAT: ReadonlySet<ShortcutAction> = new Set<ShortcutAction>([
+  'resetTerminal',
+  'toggleDictation',
+]);
+
+/**
+ * Actions that answer a key pressed inside a browser pane's page.
+ *
+ * The page receives every key first and keeps it (see shared/guest-key.ts),
+ * so anything listed here fires alongside whatever the page does with it.
+ * That is why the set is limited to what a browser itself reserves from
+ * pages: opening, closing and cycling tabs and windows. No web app relies on
+ * Ctrl+W or Ctrl+Tab, while Ctrl+B is bold in every editor and Ctrl+F is the
+ * page's own search, so those stay with the page.
+ *
+ * Keyed by action, not by chord, so a rebind still works from a page.
+ */
+export const GLOBAL_IN_PAGE: ReadonlySet<ShortcutAction> = new Set<ShortcutAction>([
+  'closeSurfaceOrPane',
+  'newSurface',
+  'reopenClosedSurface',
+  'nextSurface',
+  'prevSurface',
+  'newWorkspace',
+  'closeWorkspace',
+  'nextWorkspace',
+  'prevWorkspace',
+  'newWindow',
+]);

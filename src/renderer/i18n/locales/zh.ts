@@ -326,6 +326,7 @@ export const zh: Translation = {
   'explorer.truncated': '仅显示前 {count} 项',
   'explorer.notViewable': 'wmux 只能打开文本文件',
   'explorer.copyPath': '复制路径',
+  'explorer.viewChanges': '查看更改',
   'explorer.reveal': '在文件资源管理器中显示',
   'explorer.openInApp': '用默认应用打开',
   'explorer.error.no_root': '此窗格尚未报告工作目录',
@@ -439,6 +440,9 @@ export const zh: Translation = {
   'settings.workspacePanel.placement.end': '末尾',
   'settings.workspacePanel.autoReorder': '收到通知时自动重新排序',
   'settings.workspacePanel.showWelcomeScreen': '启动时显示欢迎界面',
+  'settings.workspacePanel.closeToTray': '关闭时最小化到托盘',
+  'settings.workspacePanel.closeToTrayHint':
+    '窗口的 × 按钮或 Alt+F4 不再退出 wmux，而是把最后一个 wmux 窗口隐藏到系统托盘，终端会话和 agent 继续运行。点击托盘图标即可恢复；托盘菜单中的“退出 wmux”才会真正退出。优先于上面的确认设置。',
   'settings.workspacePanel.confirmClose': '关闭会话前确认',
   'settings.workspacePanel.confirmCloseHint':
     '在点击 × 按钮、使用右键菜单或按 Ctrl+Shift+W 关闭会话前先询问 —— 这样误点击就不会终止尚未保存状态的代理。通过 CLI 或代理发起的关闭操作永远不会弹出询问。',
@@ -446,6 +450,8 @@ export const zh: Translation = {
   'settings.workspacePanel.restoreClaudeSessionsHint': 'wmux 恢复会话时，会在原目录下用 `claude --resume` 重新启动每个曾运行 Claude Code 的终端。默认关闭：这些窗格会同时各启动一个代理。Claude 已没有对应对话的窗格会被跳过，你正常退出的 Claude 也不会被恢复。',
   'settings.workspacePanel.restoreOmpSessions': '恢复时继续 omp 会话',
   'settings.workspacePanel.restoreOmpSessionsHint': '以 `omp --resume <path>` 在每个恢复标签页原本的目录中重新打开其精确 omp 会话。需要启用 wmux 的 omp 扩展（状态挂钩已开启）。正常退出的 omp 不会重新打开。若会话文件在此期间被删除，该窗格会安全跳过恢复，绝不偷偷新建空白会话。',
+  'settings.workspacePanel.restorePiSessions': '恢复时继续 pi 会话',
+  'settings.workspacePanel.restorePiSessionsHint': "以 `pi --session <path>` 在每个恢复标签页原本的目录中重新打开其精确 pi 会话。需要启用 wmux 的 pi 扩展（状态挂钩已开启）。pi 写入会话文件后（第一次回复之后）才会记录。退出的 pi 不会重新打开；用 /new、/resume 或 /fork 切换会话会记录新会话。会话文件已丢失或为空的标签页会被跳过，而不会新建空白会话。",
   'settings.workspacePanel.autoOpenDiff': '代理编辑文件时自动打开差异标签页',
   'settings.workspacePanel.autoOpenDiffHint':
     '当代理编辑或写入文件时，wmux 会在底部窗格弹出差异标签页。关闭此项可阻止它出现。',
@@ -681,4 +687,19 @@ export const zh: Translation = {
   'settings.remote.pair.loopbackWarn': 'wmux 仅在这台电脑上监听，且未设置公开 URL，因此该地址无法直接在手机上打开。请先让它可被访问：',
   'settings.remote.pair.paired': '已配对：{name}',
   'settings.remote.pair.close': '关闭',
+  // Browser panel right-click menu (#439).
+  'browser.menu.openLinkInNewTab': "在新标签页中打开链接",
+  'browser.menu.openLinkExternal': "在系统浏览器中打开链接",
+  'browser.menu.copyLink': "复制链接地址",
+  'browser.menu.openImageInNewTab': "在新标签页中打开图片",
+  'browser.menu.copyImage': "复制图片",
+  'browser.menu.copyImageAddress': "复制图片地址",
+  'browser.menu.cut': "剪切",
+  'browser.menu.copy': "复制",
+  'browser.menu.paste': "粘贴",
+  'browser.menu.selectAll': "全选",
+  'browser.menu.back': "后退",
+  'browser.menu.forward': "前进",
+  'browser.menu.reload': "重新加载",
+  'browser.menu.inspect': "检查",
 };

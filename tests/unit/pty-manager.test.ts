@@ -2,7 +2,11 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { PtyManager, parseShellSpec, resolveSpawnCwd, resolveShellForCwd, resolveExistingShellPath, comparePackageVersion, appExecAliasTarget, shellEnv, shellProbe, resetShellPathCache } from '../../src/main/pty-manager';
+import * as nodePty from 'node-pty';
+import { EventEmitter } from 'events';
+import { Terminal } from '@xterm/xterm';
+import { PtyManager, parseShellSpec, resolveSpawnCwd, resolveShell, resolveShellForCwd, resolveExistingShellPath, comparePackageVersion, appExecAliasTarget, shellEnv, shellProbe, resetShellPathCache, buildShellArgs } from '../../src/main/pty-manager';
+import { workspaceFallbackCwd } from '../../src/shared/paths';
 import type { SurfaceId } from '../../src/shared/types';
 
 const TEST_SHELL = 'cmd.exe';
@@ -73,6 +77,138 @@ describe('PtyManager', { timeout: 60_000 }, () => {
       env: TEST_ENV,
     });
     expect(id).toMatch(/^surf-/);
+  });
+
+  it('keeps the launch arguments when reattaching with different preferences', () => {
+    const manager = makeManager();
+    const created = manager.create({
+      shell: 'cmd.exe /q', cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV,
+    });
+    expect(created.launchShell).toBe('cmd.exe /q');
+    const reused = manager.create({
+      surfaceId: created.id, shell: 'powershell.exe', cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV,
+    });
+    expect(reused.reused).toBe(true);
+    expect(reused.launchShell).toBe('cmd.exe /q');
+  });
+
+  it('inherits the WSL shell chosen for a POSIX cwd', () => {
+    const fakePty = Object.assign(new EventEmitter(), {
+      pid: 0, onData: vi.fn(), onExit: vi.fn(), kill: vi.fn(),
+    });
+    const spawn = vi.spyOn(nodePty, 'spawn').mockReturnValue(fakePty as unknown as nodePty.IPty);
+    const hasWsl = vi.spyOn(shellEnv, 'hasWsl').mockReturnValue(true);
+    try {
+      const manager = makeManager();
+      const created = manager.create({ shell: 'cmd.exe', cwd: '/home/user/project', env: TEST_ENV });
+      expect(created.shell).toBe('wsl.exe');
+      expect(created.launchShell).toBe('wsl.exe');
+      expect(spawn).toHaveBeenCalledWith('wsl.exe', expect.any(Array), expect.any(Object));
+    } finally {
+      spawn.mockRestore();
+      hasWsl.mockRestore();
+    }
+  });
+
+  it('lets a fresh ConPTY shell inherit the cursor below visible restored output', async () => {
+    const manager = makeManager();
+    const terminal = new Terminal({ cols: 100, rows: 12, allowProposedApi: true });
+    await new Promise<void>((resolve) => terminal.write('saved output\r\n[new session]\r\n', resolve));
+    const { id } = manager.create({
+      shell: TEST_SHELL, cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV,
+      cols: terminal.cols, rows: terminal.rows, conptyInheritCursor: true,
+    });
+    const entry = (manager as unknown as {
+      ptys: Map<SurfaceId, { pendingChunks: number; writeChain: Promise<void> }>;
+    }).ptys.get(id)!;
+    let releaseQueue!: () => void;
+    // A held paste queue must not trap startup protocol replies.
+    entry.pendingChunks = 1;
+    entry.writeChain = new Promise<void>((resolve) => { releaseQueue = resolve; });
+    let received = '';
+    let inherited = false;
+    const reply = terminal.onData((data) => {
+      if (data === '\x1b[3;1R') {
+        inherited = true;
+        manager.write(id, data);
+      }
+    });
+    const unsubscribe = manager.onData(id, (data) => { received += data; terminal.write(data); });
+    try {
+      await vi.waitFor(() => {
+        expect(received).toContain('\x1b[6n');
+        expect(inherited).toBe(true);
+        const rows = Array.from({ length: terminal.rows }, (_, y) =>
+          terminal.buffer.normal.getLine(terminal.buffer.normal.baseY + y)!.translateToString(true));
+        expect(rows[0]).toBe('saved output');
+        expect(rows[1]).toBe('[new session]');
+        expect(rows.slice(2).join('')).toContain('>');
+      }, { timeout: 10_000 });
+      entry.pendingChunks = 0;
+      releaseQueue();
+      terminal.resize(102, 12);
+      manager.resize(id, 102, 12);
+      manager.write(id, 'echo CURSOR_INHERIT_TYPED_OK\r');
+      await vi.waitFor(() => {
+        const rows = Array.from({ length: terminal.buffer.normal.length }, (_, y) =>
+          terminal.buffer.normal.getLine(y)!.translateToString(true));
+        expect(rows[0]).toBe('saved output');
+        expect(rows[1]).toBe('[new session]');
+        expect(rows).toContain('CURSOR_INHERIT_TYPED_OK');
+      }, { timeout: 10_000 });
+    } finally {
+      releaseQueue();
+      unsubscribe();
+      reply.dispose();
+      terminal.dispose();
+    }
+  });
+
+  // #434: clearing xterm alone leaves ConPTY's screen copy (and its cursor) on the
+  // old bottom row, so the next echo is an absolute CUP back down there. clear()
+  // re-bases ConPTY, and the echo lands on the one row xterm kept.
+  it('clear() re-bases ConPTY so input typed after a frontend clear echoes on the kept row', async () => {
+    const manager = makeManager();
+    const terminal = new Terminal({ cols: 80, rows: 12, allowProposedApi: true });
+    const { id } = manager.create({
+      shell: TEST_SHELL, cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV, cols: 80, rows: 12,
+    });
+    const unsubscribe = manager.onData(id, (data) => terminal.write(data));
+    const viewport = () => Array.from({ length: terminal.rows }, (_, y) =>
+      terminal.buffer.active.getLine(terminal.buffer.active.baseY + y)?.translateToString(true) ?? '');
+    try {
+      await firstData(manager, id);
+      manager.write(id, 'for /L %i in (1,1,30) do @echo FILL%i\r');
+      // The screen is full and the prompt is back on the bottom row.
+      await vi.waitFor(() => {
+        const rows = viewport();
+        expect(rows).toContain('FILL30');
+        expect(rows.at(-1)).toMatch(/>$/);
+      }, { timeout: 10_000 });
+      // Let ConPTY settle before the clear, as a human pressing the key would.
+      await new Promise((r) => setTimeout(r, 300));
+      await new Promise<void>((resolve) => terminal.write('', resolve));
+
+      manager.clear(id);
+      terminal.clear();
+      manager.write(id, 'AFTERCLEAR');
+      await vi.waitFor(() => expect(viewport().join('\n')).toContain('AFTERCLEAR'), { timeout: 10_000 });
+      await new Promise((r) => setTimeout(r, 300));
+      await new Promise<void>((resolve) => terminal.write('', resolve));
+      const rows = viewport();
+      expect(rows.findIndex((row) => row.includes('AFTERCLEAR'))).toBe(0);
+    } finally {
+      unsubscribe();
+      terminal.dispose();
+    }
+  });
+
+  it('clear() is a no-op for an unknown or killed surface', () => {
+    const manager = makeManager();
+    expect(() => manager.clear('surf-missing' as SurfaceId)).not.toThrow();
+    const { id } = manager.create({ shell: TEST_SHELL, cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV });
+    manager.kill(id);
+    expect(() => manager.clear(id)).not.toThrow();
   });
 
   it('has() returns true after create and false after kill', () => {
@@ -221,6 +357,22 @@ describe('PtyManager', { timeout: 60_000 }, () => {
     expect(manager.deliverCommands('surf-nope' as SurfaceId, ['echo x'])).toBe(false);
   });
 
+  it.each([process.env.USERPROFILE || 'C:\\', '/home/user'])('does not execute WSL startup commands after a fallback, with cwd %s', (cwd) => {
+    const manager = makeManager();
+    const typeCommands = vi.spyOn(manager as any, 'typeStartupCommands');
+    const shell = path.join(os.tmpdir(), 'wmux-no-such-wsl-shell', 'wsl.exe');
+    const created = manager.create({
+      shell: `"${shell}" -d Ubuntu-24.04`,
+      cwd,
+      env: TEST_ENV,
+      startupCommands: ["pi --session '/home/user/session.jsonl'"],
+    });
+    expect(created.shellFallbackFrom).toBe(shell);
+    expect(created.startupCommandsConsumed).toBe(true);
+    expect(typeCommands).not.toHaveBeenCalled();
+    typeCommands.mockRestore();
+  });
+
   it('reports the requested shell when it fell back to the default (#252)', () => {
     const manager = makeManager();
     const created = manager.create({
@@ -229,6 +381,8 @@ describe('PtyManager', { timeout: 60_000 }, () => {
       env: TEST_ENV,
     });
     expect(created.shellFallbackFrom).toBe('definitely-not-a-shell-252.exe');
+    // The substituted default is not a spec: a tab inheriting it gets the default too.
+    expect(created.launchShell).toBe('');
     const ok = manager.create({ shell: TEST_SHELL, cwd: process.env.USERPROFILE || 'C:\\', env: TEST_ENV });
     expect(ok.shellFallbackFrom).toBeUndefined();
   });
@@ -538,6 +692,29 @@ describe('shell path resolution is memoized (issue #176)', () => {
     }
   });
 
+  it('re-resolves the "System default" shell when its cached exe disappears (#334)', () => {
+    // A Store PowerShell update removes the versioned WindowsApps directory the
+    // default shell was memoized as; the next pane must not spawn that path.
+    const before = path.join(os.tmpdir(), `wmux-default-old-${process.pid}.exe`);
+    const after = path.join(os.tmpdir(), `wmux-default-new-${process.pid}.exe`);
+    fs.writeFileSync(before, '');
+    let current = before;
+    try {
+      vi.mocked(shellProbe.onPath).mockImplementation((name: string) =>
+        name === 'pwsh.exe' || name === process.env.SHELL || name === '/bin/sh' ? current : undefined,
+      );
+      expect(resolveShell(undefined)).toBe(before);
+      expect(resolveShell(undefined)).toBe(before);
+
+      fs.unlinkSync(before);
+      fs.writeFileSync(after, '');
+      current = after;
+      expect(resolveShell(undefined)).toBe(after);
+    } finally {
+      for (const p of [before, after]) if (fs.existsSync(p)) fs.unlinkSync(p);
+    }
+  });
+
   it('resetShellPathCache() forces a fresh probe', () => {
     resolveExistingShellPath('fake-shell.exe');
     resetShellPathCache();
@@ -586,6 +763,40 @@ describe('comparePackageVersion (WindowsApps package ordering)', () => {
   });
 });
 
+
+describe('WSL launch cwd', () => {
+  it('passes a POSIX path directly to WSL', () => {
+    expect(buildShellArgs('wsl', {}, '', '/home/user/project')).toEqual(['--cd', '/home/user/project']);
+  });
+
+  it('passes a Windows directory that exists', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux wsl-cd '));
+    try {
+      expect(buildShellArgs('wsl', {}, '', dir)).toEqual(['--cd', dir]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // wsl.exe exits on a missing Windows-spelled --cd, so the pane would never start.
+  it('opens a Windows directory that is gone at the distro home', () => {
+    expect(buildShellArgs('wsl', {}, '', 'C:\\wmux-no-such-dir-397\\x')).toEqual(['--cd', '~']);
+  });
+
+  it.each([
+    ['\\\\wsl.localhost\\Ubuntu\\home\\user\\project', '/home/user/project'],
+    ['\\\\wsl$\\Ubuntu-24.04\\srv\\app', '/srv/app'],
+    ['\\\\wsl.localhost\\Ubuntu', '/'],
+  ])('passes a WSL UNC path in its POSIX spelling: %s', (cwd, posix) => {
+    expect(buildShellArgs('wsl', {}, '', cwd)).toEqual(['--cd', posix]);
+  });
+
+  it.each([undefined, '~', '%USERPROFILE%\\projects', 'C:relative', '   '])(
+    'keeps the distro-home fallback for an unreported or non-absolute cwd: %s', (cwd) => {
+      expect(buildShellArgs('wsl', {}, '', cwd)).toEqual(['--cd', '~']);
+    },
+  );
+});
 
 /**
  * CreateProcess fails with error 267 (ERROR_DIRECTORY) when handed a working
@@ -660,6 +871,12 @@ describe('resolveShellForCwd (POSIX cwd → WSL shell)', () => {
     expect(resolveShellForCwd('pwsh.exe', POSIX)).toBe('wsl.exe');
     expect(resolveShellForCwd('powershell.exe', POSIX)).toBe('wsl.exe');
     expect(resolveShellForCwd('cmd.exe', POSIX)).toBe('wsl.exe');
+  });
+
+  it('keeps a new Windows pane in PowerShell after a WSL pane reports its cwd', () => {
+    const cwd = workspaceFallbackCwd('pwsh.exe', { cwd: '/home/user/project' });
+    expect(resolveShellForCwd('pwsh.exe', cwd)).toBe('pwsh.exe');
+    expect(shellEnv.hasWsl).not.toHaveBeenCalled();
   });
 
   it('leaves a Win32 cwd alone', () => {

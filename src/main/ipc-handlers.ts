@@ -1,4 +1,9 @@
 import { ipcMain, BrowserWindow, clipboard, shell, dialog, app, nativeTheme, webContents } from 'electron';
+import { nextZoomFactor } from './zoom-factor';
+import { registerDictationIpc } from './chatgpt-dictation-ipc';
+import { focusBrowserDevTools } from './browser-tools';
+import { popupBrowserContextMenu } from './browser-context-menu-popup';
+import { isSystemBrowserUrl } from '../shared/browser-context-menu';
 import * as path from 'path';
 import { promises as fsp } from 'fs';
 import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId, type InsertionResult, type ExplorerListError } from '../shared/types';
@@ -12,6 +17,7 @@ import { agentIdentity } from './agent-identity';
 import { setDetection, forgetDetection, activeManifests } from './detection-store';
 import {
   readClipboardSource,
+  materializeClipboard,
   regularFilePaths,
   resolveInsertion,
   SurfaceInsertionQueue,
@@ -31,13 +37,21 @@ import { WindowManager, supportsBackdropMaterial, supportsTransparency, toWindow
 import { refreshShellIconCache, takeIconChangeNotice } from './icon-cache';
 import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
+import { keepRenderingLeases } from './browser-keep-rendering';
 import { AgentManager } from './agent-manager';
 import { saveNamedSession, loadNamedSession, listNamedSessions, deleteNamedSession, loadSession } from './session-persistence';
 import { listDir, resolveInRoot, isExecutablePath } from './explorer-fs';
 import { readCodeFile, writeCodeFile } from './code-file';
-import { getExplorerRoot, forgetExplorerRoot } from './explorer-roots';
+import { resolveTerminalFileLink } from './terminal-file-link';
+import { getExplorerRoot, forgetExplorerRoot, reportExplorerCwd } from './explorer-roots';
+import { parseOsc7Cwd } from '../shared/osc7';
+import * as os from 'os';
 import { sessionWindows, toRestorePayload, restoreAnswerFor } from './session-windows';
 import { loadSettings, saveSetting } from './settings-store';
+import { TerminalHistoryStore, TERMINAL_HISTORY_SETTINGS_KEY } from './terminal-history';
+import { TerminalHistoryIntegration } from './terminal-history-integration';
+import { TerminalHistoryHandoff } from './terminal-history-handoff';
+import { notificationEffects } from './notification-effects';
 import { stampAgentSessionIds } from './agent-session-persistence';
 import { readConsent, updateConsent } from './agent-integration';
 import { handleAgentStateV2 } from './agent-state-rpc';
@@ -47,6 +61,9 @@ import { getRemoteConsole } from './remote-console';
 import type { RemoteConsoleRuntime } from './remote-console/contract';
 import type { RemoteModesResult, RemoteSnapshotResult } from '../shared/remote-console-config';
 import { getChangedFiles, getFileDiff, getChangedFilesWithBaseline } from './diff-provider';
+import { createWorktree, removeWorktree, probeRepo, inspectWorktree } from './git-worktree';
+import { handleGitView, isSafeRev } from './git-view';
+import type { GitViewRequest } from '../shared/git-view';
 import {
   readMarkdownFile,
   isAllowedMarkdownPath,
@@ -55,6 +72,8 @@ import {
   MD_DIALOG_EXTENSIONS,
 } from './markdown-file';
 import { grantFilePath, isFilePathGranted } from './file-grants';
+import { readMarkdownImage } from './markdown-image';
+import { getAwakeManager, isKeepAwakeMode } from './awake-manager';
 import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
 // The process-wide singletons. Constructing a second SessionRegistry or
 // DashboardDaemon here would hand the same stream port to two surfaces and let
@@ -86,6 +105,28 @@ const agentManager = new AgentManager(ptyManager);
 const insertionQueue = new SurfaceInsertionQueue();
 const surfaceOwners = new Map<SurfaceId, number>();
 const observedWebContents = new Set<number>();
+
+let historyWindowManager: WindowManager | undefined;
+
+// One process-wide store; the desktop manager becomes available at IPC setup.
+export const terminalHistory = new TerminalHistoryIntegration({
+  handoff: new TerminalHistoryHandoff(),
+  store: new TerminalHistoryStore({ settings: { load: loadSettings, save: saveSetting } }),
+  ownerWindow: (owner) => {
+    if (!historyWindowManager) return null;
+    const wc = webContents.fromId(owner);
+    if (!wc || wc.isDestroyed()) return null;
+    const id = historyWindowManager.idForWebContents(wc);
+    const win = id ? historyWindowManager.getWindow(id) : null;
+    return win && !win.isDestroyed() && win.webContents === wc ? id : null;
+  },
+  broadcast: (state) => {
+    for (const { id } of historyWindowManager?.getAllWindows() ?? []) {
+      const win = historyWindowManager!.getWindow(id);
+      if (win && !win.isDestroyed()) win.webContents.send(IPC_CHANNELS.TERMINAL_HISTORY_STATE, state);
+    }
+  },
+});
 
 const CUSTOM_NOTIFICATION_SOUND_EXTENSIONS = ['aac', 'flac', 'm4a', 'mp3', 'oga', 'ogg', 'opus', 'wav', 'webm'] as const;
 const MAX_CUSTOM_NOTIFICATION_SOUND_BYTES = 10 * 1024 * 1024;
@@ -159,10 +200,12 @@ export function replayRemoteBindings(): void {
 
 function ownSurface(surfaceId: SurfaceId, webContents: Electron.WebContents): void {
   surfaceOwners.set(surfaceId, webContents.id);
+  terminalHistory.associate(webContents.id, surfaceId);
   if (observedWebContents.has(webContents.id)) return;
   observedWebContents.add(webContents.id);
   webContents.once('destroyed', () => {
     observedWebContents.delete(webContents.id);
+    terminalHistory.revokeOwner(webContents.id);
     for (const [ownedSurfaceId, ownerId] of surfaceOwners) {
       if (ownerId !== webContents.id) continue;
       surfaceOwners.delete(ownedSurfaceId);
@@ -569,6 +612,24 @@ const agentBrowserDeps: AgentBrowserDeps = {
 };
 
 export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstance?: CDPProxy): void {
+  registerDictationIpc({
+    desktop: (wc) => {
+      const id=windowManager.idForWebContents(wc);
+      return !!id && windowManager.getWindow(id)?.webContents===wc;
+    },
+    owns: ownsLiveSurface,
+    pid: (id) => ptyManager.getPid(id),
+  });
+  historyWindowManager = windowManager;
+  terminalHistory.registerIpc(ipcMain);
+  // Ctrl+wheel captured by the desktop before terminal scrolling consumes it.
+  ipcMain.on(IPC_CHANNELS.WINDOW_ZOOM, (event, deltaY: unknown) => {
+    if (typeof deltaY !== 'number' || !Number.isFinite(deltaY)) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win.webContents !== event.sender) return;
+    event.sender.setZoomFactor(nextZoomFactor(event.sender.getZoomFactor(), deltaY));
+  });
+
   // Toggle DevTools for the renderer window
   ipcMain.on('toggle-devtools', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -582,6 +643,9 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   });
 
   ipcMain.handle(IPC_CHANNELS.PTY_CREATE, async (_event, options) => {
+    const desktopId = windowManager.idForWebContents(_event.sender);
+    const desktop = desktopId ? windowManager.getWindow(desktopId) : null;
+    if (!desktop || desktop.isDestroyed() || desktop.webContents !== _event.sender) throw new Error('Unauthorized terminal owner');
     try {
       const resolvedOptions = {
         ...options,
@@ -702,7 +766,18 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     remoteTaps.noteResize(id);
   });
 
+  // Clear terminal buffer (#434). Only the window that owns the pane may clear
+  // its ConPTY; any other sender, or a pane with no live PTY, is ignored.
+  ipcMain.on(IPC_CHANNELS.PTY_CLEAR, (event, id: unknown) => {
+    if (!ownsLiveSurface(id, event.sender)) return;
+    ptyManager.clear(id);
+  });
+
   ipcMain.on(IPC_CHANNELS.PTY_KILL, (_event, id: SurfaceId) => {
+    const closedHistory = terminalHistory.closeSurface(_event.sender.id, id);
+    const owner = surfaceOwners.get(id);
+    // An exited terminal's history grants no authority over another window's replacement child.
+    if (owner !== undefined ? owner !== _event.sender.id : !closedHistory) return;
     ptyManager.kill(id);
     forgetSurface(id);
   });
@@ -722,9 +797,12 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     return listSystemFonts();
   });
 
-  ipcMain.on(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, (_event, url: string) => {
-    if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
-      shell.openExternal(url);
+  // http(s), plus mailto since the browser panel's "Open link in system
+  // browser" (#439) offers it for an email link. Parsed, never prefix-matched;
+  // nothing else may reach openExternal (see isSystemBrowserUrl).
+  ipcMain.on(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, (_event, url: unknown) => {
+    if (typeof url === 'string' && isSystemBrowserUrl(url)) {
+      shell.openExternal(url).catch(() => {});
     }
   });
 
@@ -842,15 +920,20 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 
   ipcMain.on(IPC_CHANNELS.NOTIFICATION_FIRE, (_event, data: { surfaceId: string; text: string; title?: string }) => {
     const window = BrowserWindow.fromWebContents(_event.sender);
-    // Show toast
-    notificationManager.showToast(data.title || 'wmux', data.text, () => {
-      if (window && !window.isDestroyed()) {
-        window.focus();
-        window.webContents.send('notification:focus-surface', data.surfaceId);
-      }
-    });
-    // Flash taskbar
-    if (window && !window.isDestroyed()) {
+    // The Settings toggles for both, which this handler used to ignore (#335).
+    const effects = notificationEffects(loadSettings()['wmux-notification-prefs']);
+    if (effects.toast) {
+      notificationManager.showToast(data.title || 'wmux', data.text, () => {
+        if (window && !window.isDestroyed()) {
+          // Hidden to the tray (#442): a click on its toast brings it back.
+          if (!window.isVisible()) window.show();
+          window.focus();
+          window.webContents.send('notification:focus-surface', data.surfaceId);
+        }
+      });
+    }
+    // Flash taskbar (a no-op while the window is focused)
+    if (effects.taskbarFlash && window && !window.isDestroyed()) {
       notificationManager.flashTaskbar(window);
     }
     // Ask the renderer to play the notification sound. The main process can't
@@ -941,9 +1024,12 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 
   ipcMain.on(
     IPC_CHANNELS.CDP_ATTACH,
-    (_event, webContentsId: number, surfaceId?: string | null, workspaceId?: string | null) => {
+    (event, webContentsId: number, surfaceId?: string | null, workspaceId?: string | null) => {
       // surfaceId/workspaceId let main route per-caller browser commands to the
       // right pane so concurrent agents don't collide (issue #62).
+      if (!Number.isInteger(webContentsId) || webContentsId <= 0) return;
+      const guest = webContents.fromId(webContentsId);
+      if (!guest || guest.isDestroyed() || guest.getType() !== 'webview' || guest.hostWebContents !== event.sender) return;
       cdpBridge.attach(webContentsId, surfaceId, workspaceId);
       cdpProxyInstance?.setWebContentsId(webContentsId);
     },
@@ -956,6 +1042,9 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       cdpProxyInstance?.setWebContentsId(null);
     }
   });
+  // A CDP client driving a hidden pane keeps it painting, as `wmux browser`
+  // does (browser-keep-rendering.ts).
+  cdpProxyInstance?.onBeforeCommand((wcId) => keepRenderingLeases.touch(wcId, cdpBridge.surfaceIdFor(wcId)));
 
   /**
    * Cheap enough to call on every entry into agent mode and from the setup
@@ -995,6 +1084,26 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     const guest = webContents.fromId(webContentsId);
     if (!guest || guest.isDestroyed() || guest.getType() !== 'webview' || guest.hostWebContents !== event.sender) return null;
     return readGuestHistory(guest);
+  });
+
+  // The browser panel's right-click menu (#439): main only pops it and
+  // answers the choice. See browser-context-menu-popup.ts.
+  ipcMain.handle(IPC_CHANNELS.BROWSER_CONTEXT_MENU, (event, items: unknown) =>
+    popupBrowserContextMenu(event.sender, items));
+
+  // The browser toolbar button is also a focus button. Electron's
+  // openDevTools() is a no-op when the detached window already exists, so
+  // clicking it again used to leave DevTools behind wmux (#413).
+  ipcMain.handle(IPC_CHANNELS.BROWSER_FOCUS_DEVTOOLS, (event, webContentsId: unknown) => {
+    if (typeof webContentsId !== 'number' || !Number.isInteger(webContentsId) || webContentsId <= 0) return false;
+    const guest = webContents.fromId(webContentsId);
+    if (!guest || guest.isDestroyed() || guest.getType() !== 'webview' || guest.hostWebContents !== event.sender) return false;
+    try {
+      focusBrowserDevTools(guest);
+      return true;
+    } catch {
+      return false;
+    }
   });
 
   /** Where the agent actually is — see the channel's note in types.ts. */
@@ -1097,10 +1206,18 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       if (!ownsLiveSurface(surfaceId, event.sender)) return { text: null };
       // Snapshot before queueing: a slow earlier upload must not make this
       // gesture read whatever happens to be on the clipboard later.
-      const source = readClipboardSource();
+      const snapshot = readClipboardSource({
+        downscaleImages: loadUserConfig().paste?.downscaleImages !== false,
+      });
+      // The image is encoded and written now, not behind an earlier gesture's
+      // upload — but only the queue decides when its path is typed (#381).
+      // The catch only keeps a failed write that a cancelled queue never
+      // awaits from being an unhandled rejection; the task still sees it.
+      const ready = materializeClipboard(snapshot);
+      ready.catch(() => undefined);
       return insertionQueue.enqueue(
         surfaceId,
-        (signal) => resolveFor(surfaceId, source, 'paste', false, signal),
+        async (signal) => resolveFor(surfaceId, await ready, 'paste', false, signal),
       );
     },
   );
@@ -1128,8 +1245,10 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     saveNamedSession(session);
     return { ok: true };
   });
-  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_NAMED, (_event, name: string) => {
-    return loadNamedSession(name);
+  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_NAMED, (event, name: string) => {
+    const session = loadNamedSession(name);
+    if (session) terminalHistory.selectNamed(event.sender.id, session);
+    return session;
   });
   ipcMain.handle(IPC_CHANNELS.SESSION_LIST_NAMED, () => {
     return listNamedSessions();
@@ -1161,7 +1280,8 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   ipcMain.on('settings:get-all-sync', (event) => {
     event.returnValue = loadSettings();
   });
-  ipcMain.on('settings:set', (_event, key: string, value: unknown) => {
+  ipcMain.on(IPC_CHANNELS.SETTINGS_SET, (_event, key: string, value: unknown) => {
+    if (key === TERMINAL_HISTORY_SETTINGS_KEY) return;
     saveSetting(key, value);
   });
 
@@ -1199,6 +1319,21 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   // window showed an empty roster beside three busy panes, and a blocked agent
   // that is waiting reports nothing at all, so it could stay invisible forever.
   ipcMain.handle(IPC_CHANNELS.AGENT_STATE_LIST, () => listAgentStates());
+
+  // Keep Awake controls
+  ipcMain.handle(IPC_CHANNELS.AWAKE_GET_STATE, () => {
+    return getAwakeManager().getState();
+  });
+  // Anything but a known mode / a real boolean is ignored: the reply is the
+  // unchanged state, never a coerced one.
+  ipcMain.handle(IPC_CHANNELS.AWAKE_SET_MODE, (_event, mode: unknown) => {
+    if (isKeepAwakeMode(mode)) getAwakeManager().setMode(mode);
+    return getAwakeManager().getState();
+  });
+  ipcMain.handle(IPC_CHANNELS.AWAKE_SET_PREVENT_DISPLAY_SLEEP, (_event, prevent: unknown) => {
+    if (typeof prevent === 'boolean') getAwakeManager().setPreventDisplaySleep(prevent);
+    return getAwakeManager().getState();
+  });
 
   // Same bootstrap problem, same shape: AGENT_IDENTITY is delta-only, and a
   // pane whose shell spec named an agent at create time never emits again.
@@ -1245,17 +1380,27 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 
   // Diff viewer handlers
   // Fallback: prefer process.cwd() (often the project dir) over USERPROFILE (never a git repo)
-  ipcMain.handle(IPC_CHANNELS.DIFF_GET_FILES, async (_event, cwd: string) => {
+  // `baseRef` is a worktree workspace's base commit (#366). It lands in git's
+  // argv, so anything that is not one safe revision is dropped, not passed.
+  const diffBaseRef = (baseRef: unknown): string | undefined =>
+    isSafeRev(baseRef) ? baseRef : undefined;
+  ipcMain.handle(IPC_CHANNELS.DIFF_GET_FILES, async (_event, cwd: string, baseRef?: unknown) => {
     const resolvedCwd = cwd || process.cwd();
-    const files = await getChangedFiles(resolvedCwd);
+    const ref = diffBaseRef(baseRef);
+    const files = await getChangedFiles(resolvedCwd, ref);
     return { files };
   });
 
-  ipcMain.handle(IPC_CHANNELS.DIFF_GET_DIFF, async (_event, cwd: string, file: string) => {
+  ipcMain.handle(IPC_CHANNELS.DIFF_GET_DIFF, async (_event, cwd: string, file: string, baseRef?: unknown) => {
     const resolvedCwd = cwd || process.cwd();
-    const diff = await getFileDiff(resolvedCwd, file);
+    const ref = diffBaseRef(baseRef);
+    const diff = await getFileDiff(resolvedCwd, file, ref);
     return { diff };
   });
+
+  // Project Git view (#362). Read-only; every argument is validated in
+  // git-view.ts, which never throws across IPC.
+  ipcMain.handle(IPC_CHANNELS.GIT_VIEW, (_event, request: GitViewRequest) => handleGitView(request));
 
   // Markdown viewer (issue #54): manual "open markdown file" entry point.
   // Shows a native file picker filtered to the allowed extensions, then reads
@@ -1313,6 +1458,14 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     return statMarkdownFile(filePath);
   });
 
+  // Markdown images (issue #380). Read-only, mints nothing, and image types
+  // only — markdown-image.ts holds the whole policy, including why the
+  // renderer-supplied document path is a base and not a permission.
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_READ_IMAGE, async (_event, documentPath: unknown, src: unknown) => {
+    if (typeof src !== 'string') return { error: 'No image path', code: 'no_path' };
+    return readMarkdownImage(typeof documentPath === 'string' ? documentPath : null, src);
+  });
+
   // ─── File explorer and code viewer ─────────────────────────────────────────
   // Every one of these takes a surfaceId and a RELATIVE path; main owns the
   // root. A renderer-supplied root would not be a jail at all — a compromised
@@ -1348,7 +1501,9 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     // reaches explorer-roots' map in the first place — that is a property of
     // today's report_pwd sources, not of this gate. If a future cwd source
     // ever feeds a remote path in here, this check would need to widen past
-    // detect()'s null to catch that too.
+    // detect()'s null to catch that too. OSC 7 (#378) is such a source, and is
+    // why EXPLORER_REPORT_OSC7 refuses any host but this machine and any path
+    // but a local drive or a WSL root before it reaches the map.
     if (sshDetector.detect(surfaceId)) {
       return { error: 'This pane is inside an SSH session', code: 'remote' };
     }
@@ -1377,6 +1532,23 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       return listDir(root.realRoot, typeof relPath === 'string' ? relPath : '', {
         showHidden: !!opts?.showHidden,
       });
+    },
+  );
+
+  // OSC 7 (#378): a shell announcing its directory through its own output —
+  // the only cwd a `wsl` typed into a PowerShell pane can report. Anything the
+  // terminal prints can forge it, so parseOsc7Cwd admits only this machine's
+  // drives and the WSL roots (a UNC path to another host would make Windows
+  // try SMB auth on realpath). Never inside ssh: that output is the remote's.
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_REPORT_OSC7,
+    (event, surfaceId: unknown, data: unknown): string | null => {
+      if (!ownsLiveSurface(surfaceId, event.sender) || typeof data !== 'string') return null;
+      if (sshDetector.detect(surfaceId)) return null;
+      const cwd = parseOsc7Cwd(data, os.hostname());
+      if (!cwd) return null;
+      reportExplorerCwd(surfaceId, cwd);
+      return cwd;
     },
   );
 
@@ -1521,6 +1693,83 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
         return { error: 'Failed to open file', code: 'read_failed' };
       }
       return { ok: true };
+    },
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_RESOLVE_FILE_LINK,
+    async (event, surfaceId: unknown, text: unknown) => {
+      // explorerRootFor answers `no_root` BEFORE it asks about ssh, and a
+      // managed `wmux ssh` pane never reports a cwd — so a pane with no root
+      // is checked for ownership and ssh here, or its remote output would be
+      // probed as local absolute paths.
+      if (!ownsLiveSurface(surfaceId, event.sender)) {
+        return { error: 'No working directory reported for this pane', code: 'no_root' };
+      }
+      if (sshDetector.detect(surfaceId as SurfaceId)) {
+        return { error: 'This pane is inside an SSH session', code: 'remote' };
+      }
+      const root = explorerRootFor(surfaceId, event.sender);
+      if ('error' in root && root.code !== 'no_root') return root;
+      return resolveTerminalFileLink('error' in root ? null : root.realRoot, text);
+    },
+  );
+
+  // Git worktree workspaces (#366). Removal takes a PATH and a mode, nothing
+  // else: main reads the repository and branch from its own registry, so the
+  // renderer cannot name a branch to delete or a directory to remove.
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_WORKTREE_CREATE,
+    async (_event, repoDir: unknown, branch: unknown, base: unknown) => {
+      if (
+        typeof repoDir !== 'string' ||
+        typeof branch !== 'string' ||
+        (base !== undefined && typeof base !== 'string')
+      ) {
+        return { ok: false, code: 'invalid_argument', error: 'Invalid argument types' };
+      }
+      try {
+        return await createWorktree({ repoRoot: repoDir, branch, base });
+      } catch (err) {
+        return { ok: false, code: 'git_failed', error: (err as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(IPC_CHANNELS.GIT_WORKTREE_INSPECT, async (_event, worktreePath: unknown) => {
+    try {
+      return await inspectWorktree(worktreePath);
+    } catch (err) {
+      return { outcome: 'error', message: (err as Error).message };
+    }
+  });
+
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_WORKTREE_REMOVE,
+    async (_event, worktreePath: unknown, mode: unknown) => {
+      if (mode !== 'keep' && mode !== 'discard') {
+        return { outcome: 'error', message: 'invalid mode' };
+      }
+      try {
+        const result = await removeWorktree(worktreePath, { mode });
+        // Outcome only — never the path (#174).
+        if (result.outcome !== 'removed') console.warn(`[worktree] ${mode} close: ${result.outcome}`);
+        return result;
+      } catch (err) {
+        return { outcome: 'error', message: (err as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_WORKTREE_PROBE,
+    async (_event, dir: unknown) => {
+      if (typeof dir !== 'string') return null;
+      try {
+        return await probeRepo(dir);
+      } catch {
+        return null;
+      }
     },
   );
 

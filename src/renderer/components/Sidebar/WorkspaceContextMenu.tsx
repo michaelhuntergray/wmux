@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom';
 import { WorkspaceInfo, WorkspaceId } from '../../../shared/types';
 import { useT } from '../../i18n';
 import type { TranslationKey } from '../../i18n';
+import { useWorkspaceLabel } from '../SplitPane/use-osc-title';
 
 interface WorkspaceContextMenuProps {
   x: number;
@@ -12,6 +13,8 @@ interface WorkspaceContextMenuProps {
   onClose: () => void;
   onPin: (id: WorkspaceId) => void;
   onRename: (id: WorkspaceId, title: string) => void;
+  /** Open the layout-preset naming dialog for this workspace (#329). */
+  onSaveAsLayout: (id: WorkspaceId) => void;
   onSetColor: (id: WorkspaceId, color: string | null) => void;
   onSetStatusOverride: (id: WorkspaceId, override: 'running' | 'idle' | null) => void;
   onMoveUp: (id: WorkspaceId) => void;
@@ -50,6 +53,7 @@ export default function WorkspaceContextMenu({
   onClose,
   onPin,
   onRename,
+  onSaveAsLayout,
   onSetColor,
   onSetStatusOverride,
   onMoveUp,
@@ -63,7 +67,11 @@ export default function WorkspaceContextMenu({
   const t = useT();
   const menuRef = useRef<HTMLDivElement>(null);
   const [renaming, setRenaming] = useState(false);
-  const [renameValue, setRenameValue] = useState(workspace.title);
+  // Starts from what the sidebar shows; see WorkspaceRow for why an untouched
+  // field must not count as a rename.
+  const workspaceLabel = useWorkspaceLabel(workspace);
+  const [renameValue, setRenameValue] = useState(workspaceLabel);
+  const renameStartRef = useRef(workspaceLabel);
   const [showColorSubmenu, setShowColorSubmenu] = useState(false);
   const [showStatusSubmenu, setShowStatusSubmenu] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -104,7 +112,7 @@ export default function WorkspaceContextMenu({
 
   const handleRenameSubmit = useCallback(() => {
     const trimmed = renameValue.trim();
-    if (trimmed) {
+    if (trimmed && renameValue !== renameStartRef.current) {
       onRename(workspaceId, trimmed);
     }
     setRenaming(false);
@@ -168,12 +176,19 @@ export default function WorkspaceContextMenu({
       ) : (
         <div
           className="ctx-menu__item"
-          onClick={() => { setRenaming(true); setRenameValue(workspace.title); }}
+          onClick={() => {
+            renameStartRef.current = workspaceLabel;
+            setRenameValue(workspaceLabel);
+            setRenaming(true);
+          }}
           role="menuitem"
         >
           {t('ctx.rename')}
         </div>
       )}
+
+      {/* Save as layout preset (#329) */}
+      {item(t('ctx.saveAsLayout', 'Save as Layout Preset…'), () => onSaveAsLayout(workspaceId))}
 
       <div className="ctx-menu__separator" />
 

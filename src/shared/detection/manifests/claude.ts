@@ -26,13 +26,33 @@ import { Manifest } from '../types';
  *
  * A character class, never a quantified group, so it cannot backtrack. Kept as
  * an explicit set rather than a Unicode block range: the block also contains
- * ordinary dingbats that appear in prose.
+ * ordinary dingbats that appear in prose. ✢ was missing until a live Claude Code
+ * 2.1.305 run in auto mode was sampled frame by frame: "✢ Flambéing… (14s · ↓
+ * 1.5k tokens · thought for 8s)", with no "esc to interrupt" anywhere, so on that
+ * frame no rule saw a run and the empty prompt below read idle.
+ *
+ * The cost, the same as for every glyph here: a transcript line that starts with
+ * one ("✢ Heading") reads as a spinner line, vetoes idle, and with a duration
+ * such as "(2s " in the last lines completes the working rule.
  */
-const SPINNER = '[✳✴✵✶✷✸✹✺✻✼✽·✦✧]';
+const SPINNER = '[✳✴✵✶✷✸✹✺✻✼✽·✦✧✢]';
+
+/**
+ * The line Claude prints when a turn is over: "✻ Cooked for 2m 1s · done 3:44 PM".
+ * It shares the spinner glyph with the working line and differs by having no
+ * live-run parenthetical — which is why `working` never fires on it.
+ */
+const TURN_DONE = `^\\s*${SPINNER}\\s+\\S+ for \\d+[hms]\\b.*\\bdone\\b`;
+
+/**
+ * The first line of one of Claude's messages or tool calls: "● Done." Windows
+ * builds draw U+25CF; elsewhere Claude Code draws U+23FA in the same place.
+ */
+const MESSAGE_START = '^[●⏺]\\s';
 
 export const claudeManifest: Manifest = {
   agent: 'claude',
-  version: 1,
+  version: 2,
 
   signatures: [
     // The mode footer. Present in every screen captured, in both modes, and
@@ -89,6 +109,71 @@ export const claudeManifest: Manifest = {
     },
 
     /**
+     * Question — the turn finished on an ordinary question for the user.
+     *
+     * All three halves are required, and together they say "current": the
+     * completed-turn marker says the run is over, the prompt box says Claude
+     * is waiting for input, and the question itself must sit in the last
+     * three non-empty lines of the message that the LAST marker closes.
+     *
+     * The prompt line may carry text, and that is deliberate. After a closed
+     * question Claude Code pre-fills a suggested answer there ("> Oui, c'est
+     * réussi.", in dim text, cursor on its first character), and a screen read
+     * as plain text cannot tell that from typing. Requiring an empty prompt
+     * lost the question on two live tries out of three. So the question stays
+     * current until the answer is SENT, which is when the transcript moves on.
+     *
+     * That third half is anchored on purpose. "A `?` somewhere near the bottom"
+     * also matches a question from the previous turn that the user already
+     * answered, when the turn after it was short. Anchored above the last
+     * marker, an answered question is by construction above an older marker.
+     *
+     * It is also bounded by the message. The region opens no higher than the
+     * line that starts Claude's last message, so a one-line answer does not
+     * lend its window to the user's wrapped prompt above it — whose
+     * continuation lines carry no prompt glyph to exclude them by.
+     *
+     * The question mark must be followed by ordinary text or end the line. It
+     * may be ASCII, Arabic `؟` or full-width `？`; CJK text runs on after the
+     * full-width one with no space, so only that one waives the space. One
+     * followed by a closing quote is Claude QUOTING a question, a line that
+     * starts with the prompt glyph is the user's own submitted text, and one
+     * that starts with `⎿` is a tool's output.
+     *
+     * Known limits, stated rather than papered over: a turn too short for
+     * Claude to print the marker is not seen at all, a past question retold
+     * without quotes in the closing lines reads as current, and so does a
+     * question on a tool output's continuation line, when the turn ends on
+     * the tool, or a full-width `？` inside a quotation that runs on past it
+     * on the same line. Each is a shape of the input; tightening the matcher
+     * for one has so far opened the next, so they are left here instead.
+     */
+    {
+      id: 'claude.question.pending',
+      state: 'question',
+      priority: 500,
+      region: { id: 'bottom_non_empty_lines', count: 12 },
+      all: [
+        { kind: 'lineRegex', value: TURN_DONE },
+        // The prompt box: ">" alone on its line, or ">" + U+00A0 + a suggestion
+        // or a draft (both captured live). The transcript repeats each message
+        // the user sent as ">" + a plain space + text, which is not the box.
+        { kind: 'lineRegex', value: '^>(\\s*$|\\u00A0)' },
+        {
+          kind: 'lineRegex',
+          value: '^\\s*[^>❯⎿\\s].*([?؟](\\s+[^\\s»"”]|\\s*$)|？\\s*([^\\s»"”」』]|$))',
+          region: {
+            id: 'non_empty_lines_above',
+            count: 3,
+            anchor: { kind: 'lineRegex', value: TURN_DONE },
+            start: { kind: 'lineRegex', value: MESSAGE_START },
+          },
+        },
+      ],
+      none: [{ kind: 'contains', value: 'esc to interrupt' }],
+    },
+
+    /**
      * Working — the spinner line.
      *
      * Both halves are required. The glyph says "a spinner frame is on screen";
@@ -100,7 +185,10 @@ export const claudeManifest: Manifest = {
       state: 'working',
       priority: 800,
       region: { id: 'bottom_non_empty_lines', count: 10 },
-      all: [{ kind: 'lineRegex', value: `^\\s*${SPINNER}\\s+\\S` }],
+      // Not a turn-done marker ("✻ Crunched for 2s · done …", see the idle
+      // rule): with one above the prompt, any "(2s " in the last message used
+      // to complete the pair and read a finished turn as working.
+      all: [{ kind: 'lineRegex', value: `^\\s*${SPINNER}\\s+(?!\\S+ for \\d+[hms]\\b|Cost:)\\S` }],
       any: [
         { kind: 'contains', value: 'esc to interrupt' },
         // "(26s · ↓ 1.4k tokens)" — elapsed seconds opening a parenthetical.
@@ -124,11 +212,11 @@ export const claudeManifest: Manifest = {
     },
 
     /**
-     * Idle — an empty prompt box at the bottom of the screen.
+     * Idle — the prompt box at the bottom of the screen, with no run under way.
      *
      * Lowest priority, and it is the only rule that concludes `idle`, so every
-     * shape above gets to disagree first. `none` is what makes it an EMPTY
-     * prompt: a run in progress leaves its footer within the same few lines.
+     * shape above gets to disagree first. `none` is what keeps a run out: a
+     * run in progress leaves its footer within the same few lines.
      */
     {
       id: 'claude.idle.prompt',
@@ -146,12 +234,22 @@ export const claudeManifest: Manifest = {
        */
       region: { id: 'bottom_non_empty_lines', count: 12 },
       all: [
-        // "> " alone on its line, optionally with the cursor block after it.
-        { kind: 'lineRegex', value: '^>\\s*$' },
+        // The prompt box: ">" alone on its line, or ">" + U+00A0 + text. Live
+        // the box is ">" + U+00A0, and after a turn Claude Code pre-fills a
+        // suggested next message there in dim text, which as plain text cannot
+        // be told from a draft and is idle either way. The U+00A0 is what tells
+        // the box from the transcript, which repeats each message the user sent
+        // as ">" + a plain space + text; that echo is not a prompt.
+        { kind: 'lineRegex', value: '^>(\\s*$|\\u00A0)' },
       ],
       none: [
         { kind: 'contains', value: 'esc to interrupt' },
-        { kind: 'lineRegex', value: `^\\s*${SPINNER}\\s+\\S` },
+        // Any spinner-glyph line EXCEPT a turn-done marker, which shares the
+        // glyph and sits above the prompt after every finished turn: "✻
+        // Crunched for 2s · done 12:40 AM" now, "✻ Baked for 3m 10s" or "✻
+        // Cost: $0.05" in earlier versions. Vetoing on one read every post-turn
+        // screen as `unknown`.
+        { kind: 'lineRegex', value: `^\\s*${SPINNER}\\s+(?!\\S+ for \\d+[hms]\\b|Cost:)\\S` },
       ],
     },
   ],

@@ -1,11 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as path from 'path';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import * as os from 'node:os';
+import { pluginNeedsUpdate } from '../../src/main/agent-plugin-file';
 
 /**
  * Issue #231 — the SHIPPED extension, not a copy of its logic.
  *
- * resources/pi-extension/wmux.js is installed verbatim into
- * ~/.pi/agent/extensions/, so the file itself is the contract. Loaded here for
+ * resources/pi-extension/wmux.js is installed with a configuration snapshot as
+ * ~/.pi/agent/extensions/wmux/index.js. Its behavior is exercised here for
  * the same reason the OpenCode plugin is (#187): that bug was one token
  * (`process.execPath`) and no test of a paraphrase would have caught it.
  */
@@ -46,7 +49,10 @@ function fakePi() {
   };
 }
 
-async function extensionWith(env: Record<string, string | undefined> = {}) {
+async function extensionWith(
+  env: Record<string, string | undefined> = {},
+  config: { instructions?: string; hooks?: boolean } = {},
+) {
   Object.assign(process.env, {
     WMUX: '1',
     WMUX_SURFACE_ID: SURFACE,
@@ -56,6 +62,7 @@ async function extensionWith(env: Record<string, string | undefined> = {}) {
   });
   for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k];
   const factory = (await load()).default;
+  factory.config = config;
   const pi = fakePi();
   factory(pi.api);
   return pi;
@@ -69,7 +76,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const key of ['WMUX', 'WMUX_SURFACE_ID', 'WMUX_CLI', 'WMUX_NODE', 'WMUX_NODE_ELECTRON']) {
+  for (const key of ['WMUX', 'WMUX_SURFACE_ID', 'WMUX_CLI', 'WMUX_NODE', 'WMUX_NODE_ELECTRON', 'PI_IMAGE_PROTOCOL']) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
@@ -81,14 +88,31 @@ describe('#231 pi extension: activation', () => {
     // pi loads global extensions for every session on the machine, including
     // ones started from a plain terminal. Registering handlers there would
     // spawn a CLI process per event for a wmux that is not running.
-    const pi = await extensionWith({ WMUX: '0' });
+    const pi = await extensionWith({ WMUX: '0', PI_IMAGE_PROTOCOL: undefined });
     expect(pi.handlers.size).toBe(0);
     expect(calls).toEqual([]);
+    expect(process.env.PI_IMAGE_PROTOCOL).toBeUndefined();
   });
 
   it('is inert with no surface id', async () => {
     const pi = await extensionWith({ WMUX_SURFACE_ID: undefined });
     expect(pi.handlers.size).toBe(0);
+  });
+
+  it('enables iTerm2 images during extension loading inside wmux', async () => {
+    await extensionWith({ PI_IMAGE_PROTOCOL: undefined });
+    expect(process.env.PI_IMAGE_PROTOCOL).toBe('iterm2');
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['none', 'kitty', 'auto', 'iterm2'])('preserves the explicit image protocol %s', async (protocol) => {
+    await extensionWith({ PI_IMAGE_PROTOCOL: protocol });
+    expect(process.env.PI_IMAGE_PROTOCOL).toBe(protocol);
+  });
+
+  it('has a distinct version marker from earlier extension sources', () => {
+    const source = readFileSync(EXTENSION, 'utf8');
+    expect(pluginNeedsUpdate(source, '// wmux-plugin-version: 1\nold source')).toBe(true);
   });
 
   it('runs the CLI through WMUX_NODE, never the host binary (#187)', async () => {
@@ -105,6 +129,48 @@ describe('#231 pi extension: activation', () => {
     const pi = await extensionWith({ WMUX_NODE_ELECTRON: '1' });
     await pi.fire('agent_start');
     expect(calls[0].opts.env.ELECTRON_RUN_AS_NODE).toBe('1');
+  });
+});
+
+describe('Pi scoped instructions', () => {
+  it.each([
+    { instructions: 'compact rules', hooks: true },
+    { instructions: 'compact rules', hooks: false },
+    { instructions: '', hooks: true },
+    { instructions: '', hooks: false },
+  ])('keeps instruction and hook registration independent: %j', async (config) => {
+    const pi = await extensionWith({}, config);
+    expect(pi.has('before_agent_start')).toBe(!!config.instructions);
+    expect(pi.has('agent_start')).toBe(config.hooks);
+    expect(pi.has('session_start')).toBe(config.hooks);
+    if (!config.hooks) {
+      await pi.fire('agent_start');
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it.each([{ WMUX: '0' }, { WMUX_SURFACE_ID: undefined }])('does not expose instructions outside an attached wmux session: %j', async (env) => {
+    const pi = await extensionWith(env, { instructions: 'compact rules', hooks: true });
+    expect(pi.handlers.size).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it('adds one named section without replacing other extensions or accumulating copies', async () => {
+    const pi = await extensionWith({}, { instructions: 'compact rules', hooks: false });
+    const event = { systemPromptOptions: { sections: { personal: 'keep this' } } };
+    await pi.fire('before_agent_start', event);
+    await pi.fire('before_agent_start', event);
+    expect(event.systemPromptOptions.sections).toEqual({ personal: 'keep this', wmux: 'compact rules' });
+    expect(calls).toEqual([]);
+  });
+
+  it('supports older Pi prompts and snapshots configuration until reload', async () => {
+    const pi = await extensionWith({}, { instructions: 'original rules', hooks: false });
+    const factory = (await load()).default;
+    factory.config = { instructions: 'replacement rules', hooks: true };
+    const handler = pi.handlers.get('before_agent_start')![0];
+    expect(handler({ systemPrompt: 'base prompt' })).toEqual({ systemPrompt: 'base prompt\n\noriginal rules' });
+    expect(pi.has('agent_start')).toBe(false);
   });
 });
 
@@ -300,6 +366,21 @@ describe('#231 pi extension: activity and metadata', () => {
 });
 
 describe('#231 pi extension: shutdown', () => {
+  it('clears live run and blocked state on reload without releasing the saved session', async () => {
+    const pi = await extensionWith();
+    await pi.fire('agent_start');
+    await pi.fire('ui_prompt_start', { title: 'Waiting' });
+    calls.length = 0;
+    await pi.fire('session_shutdown', { reason: 'reload' });
+    expect(verbs()).toEqual([
+      ['report-agent', '--surface', SURFACE, '--run-depth', '0', '--unblocked'],
+    ]);
+    const replacement = await extensionWith({}, { instructions: 'compact rules', hooks: false });
+    calls.length = 0;
+    await replacement.fire('session_start');
+    expect(calls).toEqual([]);
+  });
+
   it('releases the pane and waits for the call to land', async () => {
     // pi awaits session_shutdown handlers and then exits. Without the wait the
     // process can be gone before the spawn lands, leaving a pane declared
@@ -311,7 +392,8 @@ describe('#231 pi extension: shutdown', () => {
 
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(verbs()).toEqual([['release-agent', '--surface', SURFACE]]);
+    expect(verbs()).toHaveLength(1);
+    expect(verbs()[0].slice(0, 7)).toEqual(['release-agent', '--surface', SURFACE, '--provider', 'pi', '--reason', 'quit']);
 
     calls[0].cb(null, '', '');
     await pending;
@@ -328,12 +410,130 @@ describe('#231 pi extension: shutdown', () => {
   });
 });
 
+describe('#382 pi extension: session file reports', () => {
+  let dir: string;
+  let file: string;
+  /** A ctx whose session manager names `name` — written or not. */
+  const ctxFor = (name: string) => ({ sessionManager: { getSessionFile: () => name } });
+  const sessionReports = () => verbs().filter((v) => v[0] === 'report-session');
+  const releases = () => verbs().filter((v) => v[0] === 'release-agent');
+  const seqOf = (argv: string[]) => Number(argv[argv.indexOf('--seq') + 1]);
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'pi-ext-382-'));
+    file = path.join(dir, 'session.jsonl');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('has a distinct marker from the source that did not report sessions', () => {
+    const source = readFileSync(EXTENSION, 'utf8');
+    expect(pluginNeedsUpdate(source, '// wmux-plugin-version: 2\nold source')).toBe(true);
+  });
+
+  it('does not report at session_start a file that does not exist yet', async () => {
+    const pi = await extensionWith();
+    await pi.fire('session_start', { reason: 'startup' }, ctxFor(file));
+    await pi.fire('turn_end', {}, ctxFor(file));
+    expect(sessionReports()).toEqual([]);
+  });
+
+  it('does not report an empty file: pi --session would open a new session in its place', async () => {
+    writeFileSync(file, '');
+    const pi = await extensionWith();
+    await pi.fire('turn_end', {}, ctxFor(file));
+    expect(sessionReports()).toEqual([]);
+  });
+
+  it('reports once the first reply has written the file, then not again', async () => {
+    const pi = await extensionWith();
+    await pi.fire('session_start', { reason: 'startup' }, ctxFor(file));
+    writeFileSync(file, '{"type":"session"}\n');
+    await pi.fire('turn_end', {}, ctxFor(file));
+    await pi.fire('turn_end', {}, ctxFor(file));
+    await pi.fire('agent_settled', {}, ctxFor(file));
+    const reports = sessionReports();
+    expect(reports).toHaveLength(1);
+    expect(reports[0].slice(0, 4)).toEqual(['report-session', file, '--provider', 'pi']);
+    expect(reports[0].slice(-2)).toEqual(['--surface', SURFACE]);
+  });
+
+  it('reports a resumed or forked session at session_start, its file already on disk', async () => {
+    writeFileSync(file, '{"type":"session"}\n');
+    const pi = await extensionWith();
+    await pi.fire('session_start', { reason: 'resume' }, ctxFor(file));
+    expect(sessionReports()).toHaveLength(1);
+  });
+
+  it('retries a report whose call failed instead of remembering it as sent', async () => {
+    writeFileSync(file, '{"type":"session"}\n');
+    holdCallbacks = true;
+    const pi = await extensionWith();
+    await pi.fire('turn_end', {}, ctxFor(file));
+    calls[0].cb(new Error('pipe busy'));
+    await pi.fire('turn_end', {}, ctxFor(file));
+    expect(sessionReports()).toHaveLength(2);
+  });
+
+  it('stamps strictly increasing seqs, across rebound instances too', async () => {
+    writeFileSync(file, '{"type":"session"}\n');
+    const other = path.join(dir, 'other.jsonl');
+    writeFileSync(other, '{"type":"session"}\n');
+    const first = await extensionWith();
+    await first.fire('turn_end', {}, ctxFor(file));
+    // /new rebinds the extension: a NEW instance, the same module.
+    const second = await extensionWith();
+    await second.fire('turn_end', {}, ctxFor(other));
+    await second.fire('session_shutdown', { reason: 'quit' }, ctxFor(other));
+    const seqs = [...sessionReports(), ...releases()].map(seqOf);
+    expect(seqs.every(Number.isSafeInteger)).toBe(true);
+    expect(seqs[1]).toBeGreaterThan(seqs[0]);
+    expect(seqs[2]).toBeGreaterThan(seqs[1]);
+  });
+
+  it('derives seqs from the clock, so a new pi in the pane starts above an older one', async () => {
+    const { nextSeq } = (await load()).default.__wmuxInternals;
+    const later = Date.now() + 60_000;
+    expect(nextSeq(later)).toBe(later * 1000);
+    expect(nextSeq(later)).toBe(later * 1000 + 1);
+  });
+
+  it.each(['reload', 'new', 'resume', 'fork'])('sends no release on a %s: the next session reports its own file', async (reason) => {
+    writeFileSync(file, '{"type":"session"}\n');
+    const pi = await extensionWith();
+    await pi.fire('session_shutdown', { reason }, ctxFor(file));
+    expect(releases()).toEqual([]);
+  });
+
+  it('names the file it is leaving on a quit, so wmux clears only that one', async () => {
+    const pi = await extensionWith();
+    await pi.fire('session_shutdown', { reason: 'quit' }, ctxFor(file));
+    const [release] = releases();
+    expect(release.slice(0, 9)).toEqual([
+      'release-agent', '--surface', SURFACE, '--provider', 'pi', '--reason', 'quit', '--session', file,
+    ]);
+    expect(Number.isSafeInteger(seqOf(release))).toBe(true);
+  });
+
+  it('treats a shutdown with no reason (older pi) as a quit', async () => {
+    const pi = await extensionWith();
+    await pi.fire('session_shutdown', {}, {});
+    expect(releases()).toHaveLength(1);
+    expect(releases()[0]).not.toContain('--session');
+  });
+
+  it('survives a session manager that throws', async () => {
+    const pi = await extensionWith();
+    const ctx = { sessionManager: { getSessionFile: () => { throw new Error('boom'); } } };
+    await expect(pi.fire('turn_end', {}, ctx)).resolves.toBeUndefined();
+    await expect(pi.fire('session_shutdown', { reason: 'quit' }, ctx)).resolves.toBeUndefined();
+    expect(sessionReports()).toEqual([]);
+  });
+});
+
 describe('#231 pi extension: the copied runtime resolver', () => {
   it('agrees with the OpenCode plugin it was copied from', async () => {
-    // Both files are installed verbatim as a SINGLE file into another program's
-    // config directory, so there is nowhere shared to import from and the
-    // duplication is forced. A duplicate with no enforcement is a time bomb
-    // (#137, #168) — so it is pinned here instead.
+    // The installed extension stays self-contained; compare the resolvers so
+    // their copies cannot silently drift.
     const piResolve = (await load()).default.__wmuxInternals.resolveNodeRuntime;
     const ocResolve = (await import(/* @vite-ignore */ OPENCODE_PLUGIN))
       .WmuxPlugin.__wmuxInternals.resolveNodeRuntime;

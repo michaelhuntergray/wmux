@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../../store';
-import { findLeaf } from '../../store/split-utils';
+import { findLeaf, findSurfaceOwner } from '../../store/split-utils';
 import { useT } from '../../i18n';
 import {
   EXPLORER_MAX_ENTRIES,
@@ -15,8 +15,11 @@ import { explorerErrorKey } from './explorer-errors';
 import { ExplorerTree } from './ExplorerTree';
 import { openInPreviewTab } from './open-preview';
 import { useExplorerDiff } from './use-explorer-diff';
+import { statFor } from './explorer-diff';
+import { openDiffView } from '../Diff/open-diff';
+import { openGitView } from '../Git/open-git';
 import '../../styles/explorer.css';
-import type { PaneId, SurfaceId } from '../../../shared/types';
+import type { PaneId, SurfaceId, WorkspaceId } from '../../../shared/types';
 
 const MAX_ROOTS = 8;
 
@@ -24,12 +27,19 @@ interface ExplorerPanelProps {
   onClose: () => void;
   /** Focused pane id, lifted from App.tsx local state — not store state. */
   focusedPaneId: PaneId | null;
+  workspaceId?: WorkspaceId;
+  rootSurfaceId?: SurfaceId;
+  docked?: boolean;
+  onMoveToWorkspace?: (root: SurfaceId) => void;
+  onMoveSide?: () => void;
+  inSidebar?: boolean;
 }
 
-export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): React.JSX.Element {
+export function ExplorerPanel({ onClose, focusedPaneId, workspaceId, rootSurfaceId, docked,
+  onMoveToWorkspace, onMoveSide, inSidebar }: ExplorerPanelProps): React.JSX.Element {
   const t = useT();
-  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
-  const workspace = useStore((s) => s.workspaces.find((w) => w.id === s.activeWorkspaceId));
+  const activeWorkspaceId = useStore((s) => workspaceId ?? s.activeWorkspaceId);
+  const workspace = useStore((s) => s.workspaces.find((w) => w.id === (workspaceId ?? s.activeWorkspaceId)));
   const updateWorkspaceMetadata = useStore((s) => s.updateWorkspaceMetadata);
 
   // The root follows the FOCUSED PANE's TERMINAL, not the workspace and not
@@ -44,13 +54,19 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
   const lastTerminalByPane = useRef<Map<PaneId, string>>(new Map());
 
   const focusedSurface = useMemo(() => {
+    if (docked) {
+      if (!workspace || !rootSurfaceId) return null;
+      const owner = findSurfaceOwner([workspace], rootSurfaceId);
+      return owner ? findLeaf(workspace.splitTree, owner.paneId)?.surfaces.find(
+        (s) => s.id === rootSurfaceId && s.type === 'terminal') ?? null : null;
+    }
     if (!workspace || !focusedPaneId) return null;
     const leaf = findLeaf(workspace.splitTree, focusedPaneId);
     if (!leaf) return null;
     return pickRootSurface(
       leaf.surfaces, leaf.activeSurfaceIndex, lastTerminalByPane.current.get(focusedPaneId) ?? null,
     );
-  }, [workspace, focusedPaneId]);
+  }, [workspace, focusedPaneId, rootSurfaceId, docked]);
 
   // A pane with no terminal at all (a markdown- or browser-only pane) has no
   // root to offer. Holding the last good one beats blanking the panel: the
@@ -70,7 +86,7 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
   // cross-workspace pointer into B's saved layout.
   const stickyRef = useRef<StickyRoot | null>(null);
   const liveRoot = focusedSurface?.currentCwd ?? focusedSurface?.cwd ?? '';
-  const sticky = usableSticky(stickyRef.current, activeWorkspaceId);
+  const sticky = docked ? null : usableSticky(stickyRef.current, activeWorkspaceId);
 
   useEffect(() => {
     if (focusedPaneId && focusedSurface) {
@@ -410,6 +426,16 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
     );
   }, [surfaceId]);
 
+  // Open (or focus) the Diff view for THIS root, optionally on one file (#325).
+  // `absRoot` rather than the reported cwd: it is what the +N/-N column was
+  // computed against, so the tab lists exactly the files the tree marked.
+  // A folder row opens the view unselected — it has no single file to show.
+  const viewChanges = useCallback((row: ExplorerRow | null) => {
+    if (!activeWorkspaceId || !absRoot) return;
+    const file = row && row.entry.kind === 'file' ? row.relPath : null;
+    openDiffView(useStore.getState(), activeWorkspaceId, focusedPaneId, absRoot, file);
+  }, [activeWorkspaceId, focusedPaneId, absRoot]);
+
   const rootLabel = absRoot ? (absRoot.split(/[\\/]/).filter(Boolean).pop() ?? absRoot) : '';
 
   return (
@@ -418,11 +444,29 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
         <span className="explorer-panel__root" title={absRoot}>
           {rootLabel || t('explorer.title', 'Explorer')}
         </span>
+        {(onMoveToWorkspace || onMoveSide) && (
+          <select className="explorer-panel__placement" value="" aria-label={t('panel.move', 'Move panel')}
+            title={t('panel.move', 'Move panel')} onChange={(event) => {
+              if (event.target.value === 'workspace' && surfaceId) onMoveToWorkspace?.(surfaceId as SurfaceId);
+              if (event.target.value === 'side') onMoveSide?.();
+            }}>
+            <option value="" disabled>↗</option>
+            {onMoveToWorkspace && <option value="workspace" disabled={!surfaceId}>{t('panel.workspace', 'Move into workspace')}</option>}
+            {onMoveSide && <option value="side">{inSidebar ? t('panel.right', 'Move to right panel') : t('panel.sidebar', 'Move below workspaces')}</option>}
+          </select>
+        )}
         <button
           className="explorer-panel__action"
           title={t('explorer.refresh', 'Refresh')}
           onClick={reloadTree}
         >{'↻'}</button>
+        {diff.baseline === 'git' && activeWorkspaceId && (
+          <button
+            className="explorer-panel__action"
+            title={t('shortcutAction.openGitPanel', 'Open Git view')}
+            onClick={() => openGitView(useStore.getState(), activeWorkspaceId, focusedPaneId)}
+          >{'⑂'}</button>
+        )}
         <button
           className="explorer-panel__action"
           title={showHidden
@@ -445,7 +489,12 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
           A column of numbers that silently means one or the other is a column
           the user cannot act on. */}
       {diff.total.files > 0 && (
-        <div className="explorer-panel__diffbar">
+        <button
+          type="button"
+          className="explorer-panel__diffbar"
+          title={t('shortcutAction.openDiffPanel', 'Open diff panel')}
+          onClick={() => viewChanges(null)}
+        >
           <span className="explorer-panel__diffbar-count">
             {t('explorer.changedFiles', '{count} changed')
               .replace('{count}', String(diff.total.files))}
@@ -468,7 +517,7 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
               ? t('explorer.baselineGit', 'vs HEAD')
               : t('explorer.baselineSnapshot', 'this session')}
           </span>
-        </div>
+        </button>
       )}
       <div className="explorer-panel__body">
         {error && (
@@ -487,6 +536,8 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
             onContextMenu={handleContextMenu}
             diffStats={diff.stats}
             touched={diff.touched}
+            onViewChanges={viewChanges}
+            viewChangesLabel={t('explorer.viewChanges', 'View changes')}
           />
         )}
         {truncated && (
@@ -519,6 +570,17 @@ export function ExplorerPanel({ onClose, focusedPaneId }: ExplorerPanelProps): R
           >
             {t('explorer.copyPath', 'Copy path')}
           </div>
+          {/* Only on a row the diff actually lists — a "View changes" that
+              opens an empty diff is a dead menu item by another name. */}
+          {contextMenu.row.entry.kind === 'file' && statFor(diff.stats, contextMenu.row.relPath) && (
+            <div
+              className="ctx-menu__item"
+              role="menuitem"
+              onClick={() => { viewChanges(contextMenu.row); closeContextMenu(); }}
+            >
+              {t('explorer.viewChanges', 'View changes')}
+            </div>
+          )}
           {/* Enabled for EVERY entry — folders and binaries included. Reveal
               only selects the item in Explorer, and "open in the default app"
               is the one action that is MORE useful on a file wmux cannot

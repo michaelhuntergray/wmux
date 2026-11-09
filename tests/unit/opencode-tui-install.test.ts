@@ -162,9 +162,10 @@ describe('the shipped entry file (#310)', () => {
   const coreSrc = fs.readFileSync(corePath, 'utf-8');
 
   it('carries a version marker, or installed copies never update', () => {
-    // v2 → v3 is #310 phase 3a (blocked state): without the bump every installed
-    // TUI half keeps reporting session handles and prompts only.
-    expect(src).toMatch(/wmux-plugin-version:\s*3/);
+    // v5 → v6 retries a session report that never landed and reasserts the
+    // handle when the pane starts a turn, so a transient CLI failure no longer
+    // leaves the sidebar without that pane's session until the next switch.
+    expect(src).toMatch(/wmux-plugin-version:\s*6/);
   });
 
   it('is a v2 CLI plugin definition and the only export', () => {
@@ -173,8 +174,49 @@ describe('the shipped entry file (#310)', () => {
     expect(src).toContain('from "@opencode/plugin/tui"');
   });
 
+  it('seeds the startup route so a session that appears late is still reported', () => {
+    expect(src).toContain('createSessionSeeder');
+    expect(src).toContain('seeder.start()');
+    expect(src).toContain('seeder.stop()');
+  });
+
+  it('reasserts the held handle when a hosted execution starts', () => {
+    expect(src).toContain('reporter.reassert(root)');
+    expect(src).toContain('"session.execution.started"');
+  });
+
+  it('releases only on a real exit — a plugin reload must keep the handle', () => {
+    expect(src).toContain('releaseOnExit');
+    expect(src).toContain('callWmuxSync');
+    expect(src).toContain('process.once("exit"');
+    expect(src).not.toContain('reporter.dispose()');
+  });
+
   it('subscribes to the v2 prompt-admission event', () => {
     expect(src).toContain('session.inbox.enqueued');
+  });
+
+  it('subscribes to session.deleted so a dead handle is never restored', () => {
+    expect(src).toContain('session.deleted');
+  });
+
+  it('re-reads the route when the user switches to an existing session', () => {
+    expect(src).toContain('session.viewed');
+  });
+
+  it('falls back to a single open tab when the router has no session', () => {
+    expect(src).toContain('routeFromTabs');
+  });
+
+  it('subscribes to the execution events that drive working/idle', () => {
+    for (const type of [
+      'session.execution.started',
+      'session.execution.succeeded',
+      'session.execution.failed',
+      'session.execution.interrupted',
+    ]) {
+      expect(src).toContain(type);
+    }
   });
 
   it('subscribes to every blocked-state event the reporter understands', () => {

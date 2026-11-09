@@ -58,6 +58,7 @@ export const ACTION_LABELS: Record<ShortcutAction, string> = {
   openMarkdownPanel: 'Open markdown panel',
   toggleMarkdownSource: 'Toggle markdown source view',
   openDiffPanel: 'Open diff panel',
+  openGitPanel: 'Open Git view',
   reopenClosedSurface: 'Reopen closed tab',
   findNext: 'Find next',
   findPrevious: 'Find previous',
@@ -70,10 +71,13 @@ export const ACTION_LABELS: Record<ShortcutAction, string> = {
   markWorkspaceRead: 'Mark workspace read',
   toggleShortcutCheatSheet: 'Shortcut cheat-sheet',
   resetTerminal: 'Reset terminal state',
+  clearTerminalBuffer: 'Clear terminal buffer',
   toggleExplorer: 'Toggle file explorer',
+  toggleDictation: 'Start or stop dictation',
   togglePromptOutline: 'Prompt outline',
   togglePinnedPrompt: 'Pin / unpin prompt',
   followOutput: 'Follow output',
+  refreshSurface: 'Refresh focused surface',
 };
 
 /** Translated label for an action, falling back to the English `ACTION_LABELS` map. */
@@ -106,7 +110,7 @@ export const CATEGORY: Partial<Record<ShortcutAction, string>> = {
   newWindow: 'Workspaces', closeWindow: 'Workspaces',
   jumpToBlocked: 'Agents', openAgentNavigator: 'Agents', openHub: 'Agents',
   newSurface: 'Tabs', nextSurface: 'Tabs', prevSurface: 'Tabs', reopenClosedSurface: 'Tabs',
-  renameSurface: 'Tabs', openMarkdownPanel: 'Tabs', openDiffPanel: 'Tabs',
+  renameSurface: 'Tabs', openMarkdownPanel: 'Tabs', openDiffPanel: 'Tabs', openGitPanel: 'Tabs',
   toggleMarkdownSource: 'Tabs', toggleExplorer: 'Tabs',
   splitRight: 'Panes', splitDown: 'Panes', splitBrowserRight: 'Panes', splitBrowserDown: 'Panes',
   focusLeft: 'Panes', focusRight: 'Panes', focusUp: 'Panes', focusDown: 'Panes',
@@ -114,7 +118,8 @@ export const CATEGORY: Partial<Record<ShortcutAction, string>> = {
   toggleZoom: 'Panes', closeSurfaceOrPane: 'Panes', broadcastInput: 'Panes',
   find: 'Terminal', findNext: 'Terminal', findPrevious: 'Terminal', copyMode: 'Terminal',
   copy: 'Terminal', paste: 'Terminal', fontSizeIncrease: 'Terminal', fontSizeDecrease: 'Terminal',
-  fontSizeReset: 'Terminal', resetTerminal: 'Terminal',
+  toggleDictation: 'Terminal',
+  fontSizeReset: 'Terminal', resetTerminal: 'Terminal', clearTerminalBuffer: 'Terminal',
   // Issue #207. Terminal rather than View: all three act on one pane's
   // scrollback — where its prompts are, which one is pinned above it, and
   // whether the viewport chases its output — not on the window's chrome.
@@ -122,6 +127,7 @@ export const CATEGORY: Partial<Record<ShortcutAction, string>> = {
   toggleSidebar: 'View', showNotifications: 'View', flashFocused: 'View', openBrowser: 'View',
   browserDevTools: 'View', browserConsole: 'View', openSettings: 'View', commandPalette: 'View',
   toggleShortcutCheatSheet: 'View',
+  refreshSurface: 'View',
 };
 
 export const CATEGORY_ORDER = ['Workspaces', 'Tabs', 'Panes', 'Terminal', 'View', 'Other'];

@@ -4,7 +4,11 @@ import { useT } from '../../i18n';
 import { UserColorScheme } from '../../store/settings-slice';
 import { backdropCaps } from '../../utils/backdrop-caps';
 import { normalizeTouchPanGain, TOUCH_PAN_GAIN_MAX, TOUCH_PAN_GAIN_MIN } from '../../utils/wheel-forward';
+import { normalizeBellStyle } from '../../utils/terminal-bell';
+import { normalizeRightClickMode } from '../../utils/terminal-right-click';
 import type { ThemeConfig } from '../../../shared/types';
+import { useTerminalHistoryState } from '../../hooks/useTerminalHistoryState';
+import { terminalHistoryWarning, terminalHistoryWarningText } from '../../utils/terminal-history-feedback';
 
 /** First family of a CSS font stack, unquoted — used to match the picker. */
 function firstFamily(stack: string): string {
@@ -25,6 +29,8 @@ let importInFlight = false;
 export default function TerminalSettings() {
   const t = useT();
   const { terminalPrefs, setTerminalPrefs } = useStore();
+  const history = useTerminalHistoryState();
+  const historyWarning = terminalHistoryWarning(history.error);
   const setAppearancePrefs = useStore((s) => s.setAppearancePrefs);
   const [themes, setThemes] = useState<string[]>(['Monokai']);
   const [newSchemeName, setNewSchemeName] = useState('');
@@ -420,6 +426,68 @@ export default function TerminalSettings() {
         )}
       </p>
 
+      <div className="settings-row">
+        <label className="settings-label">
+          {t('settings.terminalPanel.oscTitleWorkspaces', 'Use the window title as the workspace name')}
+        </label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={terminalPrefs.oscTitleWorkspaces}
+          onChange={(e) => setTerminalPrefs({ oscTitleWorkspaces: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.terminalPanel.oscTitleWorkspacesHint',
+          'Name a workspace after the window title of its first terminal that sets one, until you rename it. A name you gave a workspace, or one given with --title, never changes.',
+        )}
+      </p>
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.terminalPanel.bellSection', 'Bell')}</h3>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.terminalPanel.bellStyle', 'Terminal bell')}</label>
+        <select
+          className="settings-select"
+          value={terminalPrefs.bellStyle}
+          onChange={(e) => setTerminalPrefs({ bellStyle: normalizeBellStyle(e.target.value) })}
+        >
+          <option value="visual">{t('settings.terminalPanel.bellStyle.visual', 'Flash the pane')}</option>
+          <option value="audible">{t('settings.terminalPanel.bellStyle.audible', 'Soft beep')}</option>
+          <option value="none">{t('settings.terminalPanel.bellStyle.none', 'Silent')}</option>
+        </select>
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.terminalPanel.bellStyleHint',
+          'What a bell does in a pane you can see — shells ring it on Backspace at an empty prompt or a Tab with no match. A bell in a background tab, another workspace or while wmux is in the background raises a notification instead (Settings → Notifications).',
+        )}
+      </p>
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.terminalPanel.mouseSection', 'Mouse')}</h3>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.terminalPanel.rightClick', 'Right-click')}</label>
+        <select
+          className="settings-select"
+          value={terminalPrefs.rightClick}
+          onChange={(e) => setTerminalPrefs({ rightClick: normalizeRightClickMode(e.target.value) })}
+        >
+          <option value="copyPaste">{t('settings.terminalPanel.rightClick.copyPaste', 'Copy selection, otherwise paste')}</option>
+          <option value="paste">{t('settings.terminalPanel.rightClick.paste', 'Always paste')}</option>
+          <option value="off">{t('settings.terminalPanel.rightClick.off', 'Do nothing')}</option>
+        </select>
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.terminalPanel.rightClickHint',
+          'Right-click in a terminal to copy or paste, as in Windows Terminal. In apps that use the mouse (vim, tmux), the click goes to the app — hold Shift to use the clipboard.',
+        )}
+      </p>
+
       <div className="settings-divider" />
       <h3 className="settings-section-title">{t('settings.terminalPanel.scrollbackSection', 'Scrollback')}</h3>
 
@@ -435,6 +503,29 @@ export default function TerminalSettings() {
           onChange={(e) => setTerminalPrefs({ scrollbackLines: Number(e.target.value) })}
         />
       </div>
+
+      <div className="settings-row">
+        <label className="settings-label" htmlFor="terminal-history-enabled">
+          {t('settings.terminalPanel.saveOutput', 'Save terminal output across restarts')}
+        </label>
+        <input
+          id="terminal-history-enabled"
+          type="checkbox"
+          className="settings-toggle"
+          checked={history.state?.enabled ?? false}
+          disabled={!history.state || history.pending || history.unavailable}
+          aria-describedby="terminal-history-hint terminal-history-status"
+          onChange={(e) => { void history.setEnabled(e.target.checked); }}
+        />
+      </div>
+      <p className="settings-hint" id="terminal-history-hint">
+        {t('settings.terminalPanel.saveOutputHint', 'Saved locally as unencrypted text. Turning this off removes saved copies without clearing open terminals.')}
+      </p>
+      <p className="settings-hint" id="terminal-history-status" role="status">
+        {history.pending && <>{t('settings.terminalPanel.saveOutputPending', 'Updating saved-output preference…')} </>}
+        {historyWarning && terminalHistoryWarningText(historyWarning, t)}
+        {history.unavailable && historyWarning !== 'state' && <> {terminalHistoryWarningText('state', t)}</>}
+      </p>
 
       <div className="settings-divider" />
       <h3 className="settings-section-title">{t('settings.terminalPanel.touchSection', 'Touch')}</h3>

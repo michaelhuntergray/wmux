@@ -1,7 +1,17 @@
+/**
+ * Auto-save and restore of window state: the live `session.json` (written
+ * atomically, #214), the named sessions, the version-change Auto-backups
+ * (#113, #145) and the scheduled `Auto-save …` snapshots (#238).
+ */
 import fs from 'fs';
+import { createHash } from 'crypto';
 import path from 'path';
 import { getAppDataDir } from '../shared/instance';
 import type { BrowserHistory } from '../shared/browser-history';
+import type { WorktreeMetadata } from '../shared/types';
+import type { TerminalHistoryReference } from '../shared/terminal-history';
+import { terminalSurfaceIds, withoutTerminalHistory } from './session-windows';
+import { isTerminalHistoryReference } from './terminal-history';
 
 const APPDATA_DIR = getAppDataDir();
 const SESSIONS_DIR = path.join(APPDATA_DIR, 'sessions');
@@ -15,11 +25,16 @@ export interface SessionData {
   windows: Array<{
     bounds: { x: number; y: number; width: number; height: number };
     maximized?: boolean; // restore full-size state on relaunch (issue #57)
+    /** Main-stamped references, never output bytes or part of a named layout. */
+    terminalHistory?: Record<string, TerminalHistoryReference>;
     sidebarWidth: number;
     activeWorkspaceId: string | null;
     workspaces: Array<{
       id: string;
       title: string;
+      // wmux picked the title, so it may follow the terminal's window title.
+      // Declared so the backup and snapshot copies below cannot drop it (#145).
+      titleIsDefault?: boolean;
       customColor?: string;
       pinned: boolean;
       shell: string;
@@ -34,12 +49,21 @@ export interface SessionData {
       browserUrl?: string;
       browserHistory?: BrowserHistory;
       browserWidth?: number;
+      browserPanelDocked?: boolean;
       // Same lifecycle as browserWidth: written by the renderer, and dropped
       // by backupAutoSession until the interface named it (#145).
       explorerOpen?: boolean;
+      explorerDismissed?: boolean;
       explorerWidth?: number;
       explorerExpanded?: Record<string, string[]>;
       explorerShowHidden?: boolean;
+      // Which wmux-created worktree this workspace is (#366). Carried through
+      // EVERY copy — auto-session, the version-change Auto-backup, named
+      // sessions, snapshots — because a restore that drops it turns a live
+      // checkout into an anonymous folder. Nothing sweeps on the strength of a
+      // missing binding any more, but the [WT] identity and the close dialog
+      // depend on it surviving an update.
+      worktree?: WorktreeMetadata;
     }>;
   }>;
 }
@@ -51,44 +75,29 @@ export function ensureDirectories(): void {
 }
 
 /**
- * Write the auto-session, leaving a readable file at every instant (issue #214).
- *
- * This was described as an atomic write and was not one. It wrote a temp file,
- * then `unlink`ed the live `session.json`, then renamed — so between those last
- * two calls there was no session file on disk at all. Die in that window and
- * the next launch finds nothing to restore: it falls back to a fresh Session 1
- * or to an older named session, which re-mints every pane and surface id and so
- * loses the tab names the user gave them. That is #214's "surfaces come back
- * with new ids and lose their customTitle", and it needs no explanation beyond
- * a process that aborts at an unpredictable moment — which is the rest of #214.
- *
- * The window was never necessary. The `unlink` is there for a comment that says
- * "on Windows, rename won't overwrite", and that is true of the Win32
- * `MoveFileW` but not of Node: libuv's `uv_fs_rename` calls `MoveFileExW` with
- * `MOVEFILE_REPLACE_EXISTING`, so a plain `renameSync` over an existing file is
- * both legal and atomic. The old two-step survives only as a FALLBACK, for the
- * one thing that genuinely can fail the single-step form — a transient sharing
- * violation from antivirus or a sync client holding the target open, which on a
- * path under OneDrive is not hypothetical.
+ * Replace atomically or keep the last layout and its history linkage intact.
+ * Node's Windows rename already replaces the target. Unlinking after a sharing
+ * violation would destroy the only restore authority if the retry also failed.
  */
-export function saveSession(data: SessionData): void {
-  ensureDirectories();
+export function saveSession(data: SessionData): boolean {
   const tmpFile = SESSION_FILE + '.tmp';
   try {
-    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
-    try {
-      // One step: the old file is replaced, never absent.
-      fs.renameSync(tmpFile, SESSION_FILE);
-    } catch {
-      // Target locked. Now — and only now — is the unlink worth its window,
-      // because the alternative is not saving at all.
-      try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch { /* the rename below reports */ }
-      fs.renameSync(tmpFile, SESSION_FILE);
+    ensureDirectories();
+    const safe = withoutTerminalHistory(data);
+    for (let i = 0; i < safe.windows.length; i++) {
+      const members = terminalSurfaceIds(safe.windows[i]);
+      const refs = Object.entries(data.windows[i].terminalHistory ?? {})
+        .filter(([surface, ref]) => members.has(surface) && isTerminalHistoryReference(ref))
+        .map(([surface, ref]) => [surface, { recordId: ref.recordId, generation: ref.generation }]);
+      if (refs.length) safe.windows[i].terminalHistory = Object.fromEntries(refs);
     }
+    fs.writeFileSync(tmpFile, JSON.stringify(safe, null, 2), 'utf-8');
+    fs.renameSync(tmpFile, SESSION_FILE);
+    return true;
   } catch (err) {
-    // Clean up temp file if it exists
-    try { fs.unlinkSync(tmpFile); } catch {}
+    try { fs.unlinkSync(tmpFile); } catch { /* Best-effort temp cleanup; never remove the live file. */ }
     console.error('Failed to save session:', err);
+    return false;
   }
 }
 
@@ -114,6 +123,16 @@ export function getSessionPath(): string {
 const AUTO_BACKUP_PREFIX = 'Auto-backup';
 const AUTO_BACKUP_KEEP = 3;
 
+export interface AutoSessionBackup {
+  name: string;
+  fingerprint: string;
+}
+
+/** Exact content provenance, independent of the automatic backup's display name. */
+export function sessionBackupFingerprint(session: unknown): string {
+  return createHash('sha256').update(JSON.stringify(withoutTerminalHistory(session))).digest('hex');
+}
+
 /**
  * Archive the volatile auto-session as a *named* session before it is cleared
  * on a version change (issue #113: a user lost 20+ renamed tabs by updating
@@ -131,22 +150,23 @@ const AUTO_BACKUP_KEEP = 3;
  * own thing": browsers back on the default page, pinned tabs unpinned, and a
  * second window's workspaces simply gone.
  */
-function backupAutoSession(previousVersion: string): void {
+export function backupAutoSession(previousVersion: string): AutoSessionBackup | null {
   try {
-    if (!fs.existsSync(SESSION_FILE)) return;
+    if (!fs.existsSync(SESSION_FILE)) return null;
     const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')) as SessionData;
     const windows = Array.isArray(data?.windows) ? data.windows : [];
     // Every window's workspaces, in window order. A named session restores into
     // a single window, so a multi-window layout comes back flattened — losing
     // the window split is a far smaller surprise than losing the tabs.
     const workspaces = windows.flatMap(w => (Array.isArray(w?.workspaces) ? w.workspaces : []));
-    if (workspaces.length === 0) return;
+    if (workspaces.length === 0) return null;
 
     const backup = {
       name: previousVersion ? `${AUTO_BACKUP_PREFIX} v${previousVersion}` : AUTO_BACKUP_PREFIX,
       savedAt: Date.now(),
       workspaces: workspaces.map(w => ({
         title: w.title,
+        titleIsDefault: w.titleIsDefault,
         customColor: w.customColor,
         pinned: !!w.pinned,
         shell: w.shell,
@@ -156,10 +176,13 @@ function backupAutoSession(previousVersion: string): void {
         browserUrl: w.browserUrl || '',
         browserHistory: w.browserHistory,
         browserWidth: w.browserWidth,
+        browserPanelDocked: w.browserPanelDocked,
         explorerOpen: w.explorerOpen,
+        explorerDismissed: w.explorerDismissed,
         explorerWidth: w.explorerWidth,
         explorerExpanded: w.explorerExpanded,
         explorerShowHidden: w.explorerShowHidden,
+        worktree: w.worktree,
       })),
       sidebarWidth: windows[0]?.sidebarWidth ?? 260,
     };
@@ -167,14 +190,18 @@ function backupAutoSession(previousVersion: string): void {
     // Write directly instead of via saveNamedSession: a safety net must not
     // hijack the user's last-session pointer.
     if (!fs.existsSync(SAVED_DIR)) fs.mkdirSync(SAVED_DIR, { recursive: true });
-    fs.writeFileSync(
-      path.join(SAVED_DIR, sanitizeName(backup.name) + '.json'),
-      JSON.stringify(backup, null, 2),
-      'utf-8'
-    );
+    const file = path.join(SAVED_DIR, sanitizeName(backup.name) + '.json');
+    const temp = file + '.tmp';
+    try {
+      fs.writeFileSync(temp, JSON.stringify(withoutTerminalHistory(backup), null, 2), 'utf-8');
+      fs.renameSync(temp, file);
+    } finally {
+      try { fs.unlinkSync(temp); } catch { /* only our abandoned temporary file */ }
+    }
     pruneAutoBackups();
+    return { name: backup.name, fingerprint: sessionBackupFingerprint(backup) };
   } catch {
-    /* best-effort — never block startup on a backup failure */
+    return null;
   }
 }
 
@@ -232,15 +259,24 @@ export function savedVersion(): string {
   } catch { return ''; }
 }
 
-export function handleVersionChange(currentVersion: string): boolean {
+export function handleVersionChange(currentVersion: string, history?: {
+  pending(): boolean;
+  prepare(backup: AutoSessionBackup | null, session: SessionData): boolean;
+}): boolean {
   ensureDirectories();
   try {
     const saved = fs.existsSync(VERSION_FILE) ? fs.readFileSync(VERSION_FILE, 'utf-8').trim() : '';
     if (saved === currentVersion) return false;
     // Archive, then reset, only the volatile auto-session. Named sessions
     // (SAVED_DIR) and the last-session pointer are intentionally preserved.
-    backupAutoSession(saved);
-    try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
+    // A crash after auto-session removal must not overwrite the durable handoff
+    // with an empty backup on the next launch, even before the version stamp.
+    if (!history?.pending()) {
+      const session = loadSession();
+      const backup = backupAutoSession(saved);
+      if (session && history && !history.prepare(backup, session)) return false;
+    }
+    if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
     fs.writeFileSync(VERSION_FILE, currentVersion, 'utf-8');
     return true;
   } catch { return false; }
@@ -253,7 +289,7 @@ function sanitizeName(name: string): string {
 export function saveNamedSession(session: import('../shared/types').SavedSession): void {
   if (!fs.existsSync(SAVED_DIR)) fs.mkdirSync(SAVED_DIR, { recursive: true });
   const filePath = path.join(SAVED_DIR, sanitizeName(session.name) + '.json');
-  fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+  fs.writeFileSync(filePath, JSON.stringify(withoutTerminalHistory(session), null, 2), 'utf-8');
   setLastSessionName(session.name);
 }
 
@@ -261,7 +297,7 @@ export function loadNamedSession(name: string): import('../shared/types').SavedS
   try {
     const filePath = path.join(SAVED_DIR, sanitizeName(name) + '.json');
     if (!fs.existsSync(filePath)) return null;
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return withoutTerminalHistory(JSON.parse(fs.readFileSync(filePath, 'utf-8')));
   } catch { return null; }
 }
 
@@ -313,6 +349,10 @@ export function setLastSessionName(name: string): void {
  * from an *older* file, which is the only reason there was anything to recover.
  * An "Auto-backup" existed already but only fires on a version change, so
  * between two updates there is nothing behind the live file at all.
+ *
+ * Snapshots have no timer of their own: index.ts calls `maybeSnapshotSession`
+ * on every `session:save` it writes, and the 30 s auto-save tick is what drives
+ * those. A second timer would have a second idea of what the layout is.
  *
  * Three decisions, each of which the obvious implementation gets wrong:
  *
@@ -377,6 +417,17 @@ export function shouldSnapshot(input: SnapshotDecisionInput): boolean {
 }
 
 /**
+ * Split-tree keys that move with no layout change at all. Each surface's `cwd`
+ * and `currentCwd` are rewritten on every prompt (#134). `resolvedShell` moves
+ * when a Store update reinstalls PowerShell under a new versioned folder.
+ * `activeSurfaceIndex` moves whenever a pane switches tabs. Counted, they turned
+ * the ring into the last fifteen minutes of ordinary use: three slots, each
+ * spent on a `cd` or a tab click, and the state worth recovering was rotated
+ * out behind them.
+ */
+const TREE_VIEW_STATE = new Set(['cwd', 'currentCwd', 'resolvedShell', 'launchShell', 'activeSurfaceIndex', 'terminalHistory']);
+
+/**
  * What "the layout changed" means, as one string.
  *
  * Deliberately NOT the whole session blob. `bounds` moves when the window is
@@ -385,13 +436,19 @@ export function shouldSnapshot(input: SnapshotDecisionInput): boolean {
  * the fingerprint differ on essentially every tick, i.e. no gate at all. What is
  * here is what a person would call losing something: which workspaces exist,
  * what they are called, and the shape and contents of their split trees.
+ *
+ * The split tree carries the same kind of noise one level down, so
+ * `TREE_VIEW_STATE` keys are left out of it too.
  */
 export function layoutFingerprint(data: SessionData | null | undefined): string {
   const windows = Array.isArray(data?.windows) ? data!.windows : [];
   const workspaces = windows.flatMap(w => (Array.isArray(w?.workspaces) ? w.workspaces : []));
   if (workspaces.length === 0) return '';
   try {
-    return JSON.stringify(workspaces.map(w => [w.id, w.title, w.pinned, w.splitTree]));
+    return JSON.stringify(
+      workspaces.map(w => [w.id, w.title, w.pinned, w.splitTree]),
+      (key, value) => (TREE_VIEW_STATE.has(key) ? undefined : value),
+    );
   } catch {
     // A cyclic or otherwise unserialisable tree. Returning '' means "do not
     // snapshot" rather than "snapshot every tick", which is the safe way round:
@@ -430,6 +487,7 @@ export function writeSessionSnapshot(data: SessionData, at: number = Date.now())
       savedAt: at,
       workspaces: workspaces.map(w => ({
         title: w.title,
+        titleIsDefault: w.titleIsDefault,
         customColor: w.customColor,
         pinned: !!w.pinned,
         shell: w.shell,
@@ -439,10 +497,13 @@ export function writeSessionSnapshot(data: SessionData, at: number = Date.now())
         browserUrl: w.browserUrl || '',
         browserHistory: w.browserHistory,
         browserWidth: w.browserWidth,
+        browserPanelDocked: w.browserPanelDocked,
         explorerOpen: w.explorerOpen,
+        explorerDismissed: w.explorerDismissed,
         explorerWidth: w.explorerWidth,
         explorerExpanded: w.explorerExpanded,
         explorerShowHidden: w.explorerShowHidden,
+        worktree: w.worktree,
       })),
       sidebarWidth: windows[0]?.sidebarWidth ?? 260,
     };
@@ -452,7 +513,7 @@ export function writeSessionSnapshot(data: SessionData, at: number = Date.now())
     // not hijack the user's last-session pointer.
     fs.writeFileSync(
       path.join(SAVED_DIR, sanitizeName(name) + '.json'),
-      JSON.stringify(snapshot, null, 2),
+      JSON.stringify(withoutTerminalHistory(snapshot), null, 2),
       'utf-8'
     );
     pruneByPrefix(AUTO_SNAPSHOT_PREFIX, AUTO_SNAPSHOT_KEEP);
