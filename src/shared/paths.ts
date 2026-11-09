@@ -7,6 +7,12 @@
 // belongs to. Keeping the predicate here rather than in pty-manager.ts lets the
 // renderer apply the same rule the PTY layer does, instead of re-deriving it.
 
+/** True on a Windows host; works in main (process) and the sandboxed renderer (navigator). */
+export function hostIsWindows(): boolean {
+  if (typeof navigator !== 'undefined' && navigator.userAgent) return /Windows/.test(navigator.userAgent);
+  return (globalThis as { process?: { platform?: string } }).process?.platform === 'win32';
+}
+
 /**
  * A POSIX/WSL path (e.g. /home/user/project restored from session.json — issue
  * #60). Such a path is NOT a valid working dir for a Win32 process and makes
@@ -97,8 +103,11 @@ export function cwdReportPatch(pwd: string | undefined): { cwd?: string; posixCw
 export function workspaceFallbackCwd(
   shell: string | undefined,
   workspace: { cwd?: string; posixCwd?: string } | null | undefined,
+  windows: boolean = hostIsWindows(),
 ): string | undefined {
   if (!workspace) return undefined;
+  // On Linux/macOS every pane is native POSIX: the workspace cwd is always valid.
+  if (!windows) return workspace.cwd || undefined;
   if (!isWslShell(shell)) return workspace.cwd && !isPosixPath(workspace.cwd) ? workspace.cwd : undefined;
   if (workspace.posixCwd) return workspace.posixCwd;
   return workspace.cwd && isPosixPath(workspace.cwd) ? workspace.cwd : undefined;

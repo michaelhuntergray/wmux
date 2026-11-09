@@ -17,7 +17,7 @@ import { promptSummary, type PromptEntry, type PromptSource } from './store/prom
 import { v4 as uuid } from 'uuid';
 import { buildManifestTree, describeWorkspaceTree, type ManifestWorkspaceSpec } from './store/manifest-tree';
 import { translate, type TranslationKey } from './i18n/core';
-import { isPosixPath } from '../shared/paths';
+import { isPosixPath, hostIsWindows } from '../shared/paths';
 
 /** Non-hook context (bridges the main process to the store) — reads the current language directly. */
 const bridgeT = (key: TranslationKey, fallback?: string): string =>
@@ -140,7 +140,7 @@ export function initPipeBridge(): void {
       // A POSIX folder only exists inside WSL. Since #397 a Windows pane never
       // takes a POSIX workspace cwd, so a workspace asked for on one (an agent
       // inside WSL passing $PWD) opens WSL panes unless a shell was named.
-      shell: params?.shell || (targetCwd && isPosixPath(targetCwd) && /Windows/.test(navigator.userAgent) ? 'wsl.exe' : undefined),
+      shell: params?.shell || (targetCwd && isPosixPath(targetCwd) && hostIsWindows() ? 'wsl.exe' : undefined),
       cwd: targetCwd,
       worktree: worktreeMeta,
       ...(splitTree ? { splitTree } : {}),

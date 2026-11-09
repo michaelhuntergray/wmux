@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { create } from 'zustand';
 import { createWorkspaceSlice, WorkspaceSlice } from '../../src/renderer/store/workspace-slice';
-import { cwdReportPatch, isPosixPath, isWslShell, workspaceFallbackCwd } from '../../src/shared/paths';
+import { cwdReportPatch, isPosixPath, isWslShell, workspaceFallbackCwd as fallbackCwd } from '../../src/shared/paths';
+
+// These cases describe a Windows host; the Linux host has its own test below.
+const workspaceFallbackCwd = (shell: string | undefined, ws: Parameters<typeof fallbackCwd>[1]) => fallbackCwd(shell, ws, true);
 import { WorkspaceId } from '../../src/shared/types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +136,12 @@ describe('workspaceFallbackCwd', () => {
 
   it.each(['pwsh.exe', 'cmd.exe', undefined])('does not give a POSIX workspace cwd to %s', (shell) => {
     expect(workspaceFallbackCwd(shell, { cwd: '/home/u/project' })).toBeUndefined();
+  });
+
+  it('on a Linux host hands any shell the POSIX workspace cwd', () => {
+    expect(fallbackCwd(undefined, { cwd: '/home/u/project' }, false)).toBe('/home/u/project');
+    expect(fallbackCwd('/bin/bash', { cwd: '/home/u/project' }, false)).toBe('/home/u/project');
+    expect(fallbackCwd('bash', {}, false)).toBeUndefined();
   });
 
   it('returns undefined for a surface with no workspace', () => {
