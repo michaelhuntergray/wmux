@@ -11,3 +11,9 @@
 - Worked: keep the full resource as the skill source, render both resources with the same CLI path resolver, and compare contents before rewriting.
 - Corrected: the full resource uses CRLF, so strip marker lines after splitting on either line ending.
 - Candidate skill: none; this was a one-off resource split.
+
+## MIC-920 upstream merge and Linux pane fixes
+- Tried: merge upstream v2.59.1, rebuild the AppImage, run it on lab.
+- Worked: codex review with the diff piped on stdin and `timeout 240`; KWin scripting via `qdbus6` plus journal output to read and set window geometry.
+- Corrected: upstream's Windows-only assumptions (WSL forced for POSIX cwd, `C:\` spawn fallback, token dir) broke every Linux pane; node-pty needs `electron-rebuild -w node-pty`; `pkill -f` on the AppImage path killed my own shell.
+- Candidate skill: a post-merge Linux smoke test (launch, `wmux new-workspace`, read-screen) so Windows-only regressions show up before install.
