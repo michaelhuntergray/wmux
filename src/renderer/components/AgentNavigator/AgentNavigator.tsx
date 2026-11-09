@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useWorkspaceLabels } from '../SplitPane/use-osc-title';
 import { useStore } from '../../store';
 import { useT } from '../../i18n';
-import { rollupAgents, workspaceAgentState } from '../../store/agent-rollup';
+import { rankedRoster, rollupAgents, workspaceAgentState } from '../../store/agent-rollup';
 import type { AgentRosterEntry, AgentPresenceState } from '../../store/agent-rollup';
 import { formatDwell } from '../Sidebar/AgentRosterBanner';
 import '../../styles/agent-navigator.css';
@@ -31,7 +32,7 @@ function reasonFallback(
 }
 
 const FILTER_KEYS: Record<string, Filter> = {
-  a: 'all', b: 'blocked', w: 'working', i: 'idle', u: 'unknown',
+  a: 'all', b: 'blocked', q: 'question', w: 'working', i: 'idle', u: 'unknown',
 };
 
 /**
@@ -52,26 +53,24 @@ export default function AgentNavigator({ onClose, onFocusAgent }: {
   const agentStates = useStore((s) => s.agentStates);
   const agentIdentities = useStore((s) => s.agentIdentities);
   const agentDetections = useStore((s) => s.agentDetections);
+  const workspaceLabels = useWorkspaceLabels(workspaces);
   const [filter, setFilter] = useState<Filter>('all');
   const [selected, setSelected] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const listRef = useRef<HTMLDivElement>(null);
 
   const rollup = useMemo(
-    () => rollupAgents(workspaces, agentStates, now, agentIdentities, agentDetections),
-    [workspaces, agentStates, agentIdentities, agentDetections, now],
+    () => rollupAgents(workspaces, agentStates, now, agentIdentities, agentDetections, workspaceLabels),
+    [workspaces, agentStates, agentIdentities, agentDetections, now, workspaceLabels],
   );
 
   /**
-   * Blocked first and longest-waiting first, then everything else in tree
-   * order. Ranking by urgency rather than by position is the whole point: the
-   * sidebar already shows tree order, and re-showing it here would answer a
-   * question the user can already see the answer to.
+   * Blocked first and longest-waiting first, then questions, then everything
+   * else in tree order. Ranking by urgency rather than by position is the whole
+   * point: the sidebar already shows tree order, and re-showing it here would
+   * answer a question the user can already see the answer to.
    */
-  const ordered = useMemo(() => {
-    const rest = rollup.roster.filter((e) => e.state !== 'blocked');
-    return [...rollup.blocked, ...rest];
-  }, [rollup]);
+  const ordered = useMemo(() => rankedRoster(rollup), [rollup]);
 
   const visible = useMemo(
     () => (filter === 'all' ? ordered : ordered.filter((e) => e.state === filter)),
@@ -124,6 +123,7 @@ export default function AgentNavigator({ onClose, onFocusAgent }: {
   const filterLabels: Array<[Filter, string, number]> = [
     ['all', t('agentNavigator.filterAll', 'all'), counts.total],
     ['blocked', t('agentNavigator.filterBlocked', 'blocked'), counts.blocked],
+    ['question', t('agentNavigator.filterQuestion', 'question'), counts.question],
     ['working', t('agentNavigator.filterWorking', 'working'), counts.working],
     ['idle', t('agentNavigator.filterIdle', 'idle'), counts.idle],
     ['unknown', t('agentNavigator.filterUnknown', 'silent'), counts.unknown],
@@ -195,7 +195,7 @@ export default function AgentNavigator({ onClose, onFocusAgent }: {
         </div>
 
         <div className="agent-nav__hint">
-          {t('agentNavigator.hint', '↑↓ move · enter jump · a/b/w/i filter · esc close')}
+          {t('agentNavigator.hint', '↑↓ move · enter jump · a/b/q/w/i/u filter · esc close')}
           <span className="agent-nav__hint-rollup">
             {workspaces
               .filter((w) => workspaceAgentState(rollup.byWorkspace[w.id]) !== null)

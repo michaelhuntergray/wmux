@@ -45,7 +45,7 @@ export function bindingsEqual(a: ShortcutBinding, b: ShortcutBinding): boolean {
 
 /** Build a binding from a keydown-like event; null for a bare modifier press. */
 export function bindingFromEvent(e: KeyEventLike): ShortcutBinding | null {
-  if (MODIFIER_KEYS.has(e.key)) return null;
+  if (!e.key || MODIFIER_KEYS.has(e.key)) return null;
   return {
     key: e.key,
     ctrl: e.ctrlKey || undefined,
@@ -54,7 +54,7 @@ export function bindingFromEvent(e: KeyEventLike): ShortcutBinding | null {
   };
 }
 
-// ─── "Does wmux claim this keystroke?" (issue: Ctrl+N dead over a terminal) ──
+// ─── "Does wmux claim this keystroke?" (#225: Ctrl+N dead over a terminal) ──
 // Lives here, next to bindingsEqual, because TWO callers must agree on the
 // answer or keys get swallowed by neither side:
 //
@@ -74,6 +74,9 @@ export function bindingFromEvent(e: KeyEventLike): ShortcutBinding | null {
  * are muscle memory, and a global binding that ate them would make the terminal
  * unusable. Ctrl+Shift+* and Ctrl+Alt+* are free by construction — a terminal
  * has no meaning for them.
+ *
+ * This list is load-bearing inside a terminal too: there Ctrl+D is split-right,
+ * not EOF.
  */
 export const SAFE_CTRL_KEYS: ReadonlySet<string> = new Set(['b', 'd', 'n', 't', 'w', 'f', ',']);
 

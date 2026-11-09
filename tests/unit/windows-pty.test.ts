@@ -56,10 +56,20 @@ describe('useTerminal wiring', () => {
   it('fits the buffer to the pane before anything is written into it', () => {
     const open = USE_TERMINAL.indexOf('terminal.open(terminalRef.current)');
     const fit = USE_TERMINAL.indexOf('\n    fit();', open);
-    const replay = USE_TERMINAL.indexOf('surfaceBufferCache.get(surfaceId)');
     expect(open).toBeGreaterThan(-1);
     expect(fit).toBeGreaterThan(open);
-    expect(fit).toBeLessThan(replay);
+
+    // The snapshot is read only inside restoreSurfaceState, defined after the fit.
+    const restore = USE_TERMINAL.indexOf('const restoreSurfaceState = (');
+    const take = USE_TERMINAL.indexOf('surfaceBufferCache.take(surfaceId');
+    expect(restore).toBeGreaterThan(fit);
+    expect(take).toBeGreaterThan(restore);
+
+    // Runtime lookup/restore ordering is exercised by the production helper's
+    // behavioral lifecycle tests. The initial synchronous fit still precedes it.
+    const connection = USE_TERMINAL.indexOf('    connectTerminalWithHistory({');
+    expect(connection).toBeGreaterThan(fit);
+    expect(USE_TERMINAL.indexOf('restoreLive: restoreSurfaceState', connection)).toBeGreaterThan(connection);
   });
 
   it('replays a snapshot at the size it was taken at, before writing it', () => {

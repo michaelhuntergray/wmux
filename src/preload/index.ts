@@ -1,7 +1,14 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import * as os from 'os';
-import { IPC_CHANNELS, type InsertionResult, type NotificationSoundPickResult, type UpdateTriggerResult } from '../shared/types';
+import { IPC_CHANNELS, type InsertionResult, type NotificationSoundPickResult, type UpdateTriggerResult,
+  type KeepAwakeMode, type KeepAwakeState, type SessionSaveRequest,
+  type WorktreeCloseMode, type WorktreeInspectResult, type WorktreeRemoveResult,
+} from '../shared/types';
 import type { BrowserHistory } from '../shared/browser-history';
+import type { BrowserMenuAction, BrowserMenuItem } from '../shared/browser-context-menu';
+import type { DictationBridge, DictationCommand, DictationState } from '../shared/dictation';
+import type { GuestKey } from '../shared/guest-key';
+import type { TerminalHistoryBridge, TerminalHistoryState } from '../shared/terminal-history';
 import type {
   RemoteConsoleBridge,
   RemoteConsoleStatus,
@@ -30,14 +37,40 @@ const remoteConsole: RemoteConsoleBridge = {
   replyRenderer: (reqId, result) => ipcRenderer.send(IPC_CHANNELS.REMOTE_RENDERER_REPLY, reqId, result),
 };
 
+const terminalHistory: TerminalHistoryBridge = {
+  getState: () => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_HISTORY_GET_STATE),
+  setEnabled: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_HISTORY_SET_ENABLED, enabled),
+  getBinding: (surface) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_HISTORY_BINDING, surface),
+  read: (surface, binding) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_HISTORY_READ, surface, binding),
+  checkpoint: (surface, binding, revision, record) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_HISTORY_CHECKPOINT, surface, binding, revision, record),
+  onState: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: TerminalHistoryState) => callback(state);
+    ipcRenderer.on(IPC_CHANNELS.TERMINAL_HISTORY_STATE, handler);
+    return () => { ipcRenderer.removeListener(IPC_CHANNELS.TERMINAL_HISTORY_STATE, handler); };
+  },
+};
+
 contextBridge.exposeInMainWorld('wmux', {
+  dictation: {
+    command: (command: DictationCommand) => ipcRenderer.invoke(IPC_CHANNELS.DICTATION_COMMAND, command),
+    onState: (callback: (state: DictationState) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, state: DictationState) => callback(state);
+      ipcRenderer.on(IPC_CHANNELS.DICTATION_STATE, handler);
+      return () => { ipcRenderer.removeListener(IPC_CHANNELS.DICTATION_STATE, handler); };
+    },
+  } satisfies DictationBridge,
+  terminalHistory,
   pty: {
-    create: (options: { shell: string; cwd: string; env: Record<string, string>; surfaceId?: string; startupCommands?: string[]; cols?: number; rows?: number }) =>
-      ipcRenderer.invoke(IPC_CHANNELS.PTY_CREATE, options) as Promise<{ id: string; shell: string; startupCommandsConsumed?: boolean; shellFallbackFrom?: string }>,
+    create: (options: { shell: string; cwd: string; env: Record<string, string>; surfaceId?: string; startupCommands?: string[]; cols?: number; rows?: number; conptyInheritCursor?: boolean }) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PTY_CREATE, options) as Promise<{ id: string; shell: string; launchShell: string; startupCommandsConsumed?: boolean; reused: boolean; shellFallbackFrom?: string }>,
     write: (id: string, data: string) =>
       ipcRenderer.send(IPC_CHANNELS.PTY_WRITE, id, data),
     resize: (id: string, cols: number, rows: number) =>
       ipcRenderer.send(IPC_CHANNELS.PTY_RESIZE, id, cols, rows),
+    // ConPTY's own screen copy, cleared alongside xterm's (#434).
+    clear: (id: string) =>
+      ipcRenderer.send(IPC_CHANNELS.PTY_CLEAR, id),
     kill: (id: string) =>
       ipcRenderer.send(IPC_CHANNELS.PTY_KILL, id),
     has: (id: string) =>
@@ -73,6 +106,7 @@ contextBridge.exposeInMainWorld('wmux', {
     openExternal: (url: string) => ipcRenderer.send(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, url),
     getVersion: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_VERSION),
     toggleDevTools: () => ipcRenderer.send('toggle-devtools'),
+    zoom: (deltaY: number) => ipcRenderer.send(IPC_CHANNELS.WINDOW_ZOOM, deltaY),
     pickFolder: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_PICK_FOLDER),
     // Restart Explorer with its icon cache cleared (issues #137/#226). Main
     // puts up the confirm itself — the dialog names the cost (File Explorer
@@ -83,6 +117,7 @@ contextBridge.exposeInMainWorld('wmux', {
     // changed the app icon — the renderer turns it into a bell notification.
     takeIconChangeNotice: (): Promise<boolean> =>
       ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_TAKE_ICON_CHANGE_NOTICE),
+    // The "Open in wmux" Explorer verb (HKCU).
     getContextMenu: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU) as Promise<boolean>,
     setContextMenu: (enabled: boolean, label?: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, enabled, label) as Promise<{
@@ -143,6 +178,28 @@ contextBridge.exposeInMainWorld('wmux', {
     /** The webview's back/forward stack, to persist it (#315). Null for a guest this window does not host. */
     getHistory: (webContentsId: number): Promise<BrowserHistory | null> =>
       ipcRenderer.invoke(IPC_CHANNELS.BROWSER_GET_HISTORY, webContentsId),
+    focusDevTools: (webContentsId: number): Promise<boolean> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_FOCUS_DEVTOOLS, webContentsId),
+    /** Shortcut-shaped keys pressed inside a browser pane's page. See webview-guest-keys.ts. */
+    onGuestKey: (cb: (webContentsId: number, key: GuestKey) => void) => {
+      const handler = (_event: unknown, webContentsId: number, key: GuestKey) => cb(webContentsId, key);
+      ipcRenderer.on(IPC_CHANNELS.BROWSER_GUEST_KEY, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_GUEST_KEY, handler);
+    },
+    /** Pop the right-click menu (#439); answers the chosen action or null. See shared/browser-context-menu.ts. */
+    showContextMenu: (items: BrowserMenuItem[]): Promise<BrowserMenuAction | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_CONTEXT_MENU, items),
+    /**
+     * A guest asked to open a link in a new tab (Ctrl+click or middle-click).
+     * Every pane hears it; the one hosting `webContentsId` acts on it.
+     */
+    onOpenInNewTab: (callback: (webContentsId: number, url: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, webContentsId: unknown, url: unknown) => {
+        if (typeof webContentsId === 'number' && typeof url === 'string') callback(webContentsId, url);
+      };
+      ipcRenderer.on(IPC_CHANNELS.BROWSER_OPEN_IN_NEW_TAB, handler);
+      return () => { ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_OPEN_IN_NEW_TAB, handler); };
+    },
   },
   agent: {
     list: (workspaceId?: string) => ipcRenderer.invoke(IPC_CHANNELS.AGENT_LIST, workspaceId),
@@ -188,8 +245,8 @@ contextBridge.exposeInMainWorld('wmux', {
     },
   },
   clipboard: {
-    // No pasteImage/readFiles: reading the clipboard for a paste is main's
-    // job now (remote.resolvePaste), because only main can act on what it
+    // No pasteImage/readFiles since 1.12.0: reading the clipboard for a paste
+    // is main's job now (remote.resolvePaste), because only main can act on what it
     // finds. These remain for copy and older renderer call sites.
     writeText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text),
     readText: () => ipcRenderer.invoke('clipboard:read-text') as Promise<string>,
@@ -247,6 +304,8 @@ contextBridge.exposeInMainWorld('wmux', {
   // Release notes, in the app (issue #211). Deliberately its own namespace
   // rather than a member of `update`: this answers "what changed", including in
   // versions already installed, and works fine when there is no update at all.
+  // Takes only a refresh flag: no repo, URL or token, so a compromised renderer
+  // cannot point it somewhere else.
   changelog: {
     get: (opts?: { refresh?: boolean }) => ipcRenderer.invoke(IPC_CHANNELS.CHANGELOG_GET, opts),
   },
@@ -316,6 +375,17 @@ contextBridge.exposeInMainWorld('wmux', {
     // Read-only seed for onUpdate, which is delta-only (see App.tsx).
     list: (): Promise<any[]> => ipcRenderer.invoke(IPC_CHANNELS.AGENT_STATE_LIST),
   },
+  awake: {
+    getState: (): Promise<KeepAwakeState> => ipcRenderer.invoke(IPC_CHANNELS.AWAKE_GET_STATE),
+    setMode: (mode: KeepAwakeMode): Promise<KeepAwakeState> => ipcRenderer.invoke(IPC_CHANNELS.AWAKE_SET_MODE, mode),
+    setPreventDisplaySleep: (prevent: boolean): Promise<KeepAwakeState> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AWAKE_SET_PREVENT_DISPLAY_SLEEP, prevent),
+    onStateChange: (callback: (state: KeepAwakeState) => void) => {
+      const handler = (_event: any, state: KeepAwakeState) => callback(state);
+      ipcRenderer.on(IPC_CHANNELS.AWAKE_STATE_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.AWAKE_STATE_CHANGED, handler);
+    },
+  },
   // Which agent each surface runs. Carries the derived KIND only; the command
   // line it came from never leaves the main process (see index.ts).
   agentIdentity: {
@@ -354,15 +424,18 @@ contextBridge.exposeInMainWorld('wmux', {
   session: {
     save: (session: any) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_SAVE_NAMED, session),
     load: (name: string) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_LOAD_NAMED, name),
+    loadStartupFallback: (name: string): Promise<import('../shared/types').SavedSession | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_LOAD_STARTUP_FALLBACK, name),
     list: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_LIST_NAMED),
     delete: (name: string) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_DELETE_NAMED, name),
     loadAuto: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_LOAD_AUTO),
-    onAutoSaveRequest: (callback: () => void) => {
-      const handler = () => callback();
-      ipcRenderer.on('session:request', handler);
-      return () => ipcRenderer.removeListener('session:request', handler);
+    onAutoSaveRequest: (callback: (request?: SessionSaveRequest) => void) => {
+      const handler = (_event: unknown, request?: SessionSaveRequest) => callback(request);
+      ipcRenderer.on(IPC_CHANNELS.SESSION_REQUEST, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.SESSION_REQUEST, handler);
     },
-    pushAutoSave: (data: any) => ipcRenderer.send('session:save', data),
+    pushAutoSave: (data: any, token?: string) => ipcRenderer.send(IPC_CHANNELS.SESSION_SAVE, data, token),
+    historyDone: (token: string, success: boolean) => ipcRenderer.send(IPC_CHANNELS.SESSION_HISTORY_DONE, token, success),
   },
   markdown: {
     // Manual "open markdown file" entry point (issue #54): native file picker +
@@ -384,6 +457,11 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_FILE, filePath, content, expectedMtimeMs),
     saveAs: (content: string, suggestedName?: string, defaultDir?: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_AS, content, suggestedName, defaultDir),
+    // A local image the document names (#380). `documentPath` is only the base
+    // a relative src resolves against (null for a pathless surface); main
+    // re-checks the image's type and bytes whatever it is given.
+    readImage: (documentPath: string | null, src: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_READ_IMAGE, documentPath, src),
   },
   explorer: {
     // The renderer sends a surfaceId and a RELATIVE path — never an absolute
@@ -406,6 +484,14 @@ contextBridge.exposeInMainWorld('wmux', {
     // `markdown.readFile` below takes an absolute path and mints nothing.
     readMarkdown: (surfaceId: string, relPath: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_READ_MARKDOWN, surfaceId, relPath),
+    // An exception to the rule above: it takes the path as PRINTED, and
+    // main jails it (see terminal-file-link.ts).
+    resolveTerminalLink: (surfaceId: string, text: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESOLVE_FILE_LINK, surfaceId, text),
+    // A pane's own OSC 7 cwd report (#378), forwarded RAW: main decides what
+    // it means. Resolves to the accepted Windows path, or null.
+    reportOsc7: (surfaceId: string, data: string): Promise<string | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_REPORT_OSC7, surfaceId, data),
   },
   code: {
     // Same rule as `explorer` above: a surfaceId and a RELATIVE path, never an
@@ -422,13 +508,18 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.invoke(IPC_CHANNELS.CODE_WRITE_FILE, surfaceId, relPath, content, expectedMtimeMs),
   },
   diff: {
-    getFiles: (cwd: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_FILES, cwd),
-    getFileDiff: (cwd: string, file: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_DIFF, cwd, file),
+    getFiles: (cwd: string, baseRef?: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_FILES, cwd, baseRef),
+    getFileDiff: (cwd: string, file: string, baseRef?: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_DIFF, cwd, file, baseRef),
     onUpdate: (callback: (data: { file?: string }) => void) => {
       const handler = (_event: any, data: any) => callback(data);
       ipcRenderer.on(IPC_CHANNELS.DIFF_UPDATE, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.DIFF_UPDATE, handler);
     },
+  },
+  // The project Git view (#362). One read-only request shape, validated in
+  // main; the renderer never names a git sub-command or an argument.
+  git: {
+    view: (request: unknown) => ipcRenderer.invoke(IPC_CHANNELS.GIT_VIEW, request),
   },
   cdp: {
     attach: (webContentsId: number, surfaceId?: string | null, workspaceId?: string | null) =>
@@ -498,9 +589,24 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.invoke(IPC_CHANNELS.WINDOW_SET_BACKDROP, enabled, material),
     supportsBackdrop: (): Promise<{ transparency: boolean; materials: boolean }> =>
       ipcRenderer.invoke(IPC_CHANNELS.WINDOW_SUPPORTS_BACKDROP),
-    // For the renderer-drawn caption buttons a frameless window needs.
+    // For the renderer-drawn caption buttons a frameless window needs. Clear
+    // mode is frameless, and entering or leaving it takes a new window, which
+    // is what the restart banner's relaunch is for.
     closeSelf: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_CLOSE_SELF),
     isFrameless: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.WINDOW_IS_FRAMELESS),
     relaunch: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_RELAUNCH),
+  },
+  // Git worktree workspaces (#366). `remove` names a path and a mode and
+  // nothing else: main reads the repository and branch from its own record of
+  // what it created, so there is no "delete this branch" call to abuse.
+  worktree: {
+    create: (repoDir: string, branch: string, base?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_WORKTREE_CREATE, repoDir, branch, base),
+    inspect: (worktreePath: string): Promise<WorktreeInspectResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_WORKTREE_INSPECT, worktreePath),
+    remove: (worktreePath: string, mode: WorktreeCloseMode): Promise<WorktreeRemoveResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_WORKTREE_REMOVE, worktreePath, mode),
+    probe: (dir: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_WORKTREE_PROBE, dir),
   },
 });

@@ -16,8 +16,8 @@ import type { RemoteScope } from './remote-console-protocol';
 export const REMOTE_DEFAULT_PORT = 9790;
 /**
  * Vite's manifest, emitted at `dist/renderer/remote-manifest.json` rather than
- * the default `.vite/manifest.json`: neither electron-builder's `dist/**` glob
- * nor the manual `asar pack` is guaranteed to keep a dot directory.
+ * the default `.vite/manifest.json`: electron-builder's `dist/**` glob is not
+ * guaranteed to keep a dot directory.
  */
 export const REMOTE_MANIFEST_FILE = 'remote-manifest.json';
 /** The phone page's key in that manifest; the static server walks its closure only. */
@@ -240,6 +240,13 @@ export interface RemoteRosterSource {
   workspaceTitle: string;
   label: string;
   kind: string | null;
+  /**
+   * A CLOSED set, and narrower than the desktop's: the desktop roster also has
+   * `question` (an agent that ended its turn on an ordinary question). The
+   * phone has no such state, so `toRemoteRosterSource` sends it as the declared
+   * `idle` it refines. Adding it here is a protocol change —
+   * main's validation and the phone UI both have to learn it first.
+   */
   state: 'blocked' | 'working' | 'idle' | 'unknown';
   stateSource: 'declared' | 'detected' | null;
   blockedReason: string | null;
@@ -262,6 +269,7 @@ export interface RemoteDesktopNotice {
 
 // ── Preload bridge (`window.wmux.remoteConsole`) ────────────────────────
 
+/** Every invoke answers `{ error: 'unavailable' }` when the runtime did not load, never a throw. */
 export type RemoteBridgeError = { error: string };
 
 export interface RemoteConsoleBridge {
@@ -274,7 +282,9 @@ export interface RemoteConsoleBridge {
   rename(id: string, name: string): Promise<void | RemoteBridgeError>;
   /** Hide the refused-origin card until another origin is refused. */
   dismissRejectedOrigin(): Promise<void | RemoteBridgeError>;
+  /** Returns an unsubscribe, as does `onRendererRequest`. */
   onState(cb: (status: RemoteConsoleStatus) => void): () => void;
   onRendererRequest(cb: (req: RemoteRendererRequest) => void): () => void;
+  /** Answers a snapshot or modes request from `onRendererRequest`. */
   replyRenderer(reqId: string, result: RemoteSnapshotResult | RemoteModesResult): void;
 }

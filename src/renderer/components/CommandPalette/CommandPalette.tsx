@@ -4,6 +4,8 @@ import { SurfaceId } from '../../../shared/types';
 import { ShortcutAction, ShortcutBinding } from '../../store/settings-slice';
 import { actionLabel } from '../Settings/KeyboardSettings';
 import { useT } from '../../i18n';
+import { RESET_TERMINAL_LEAVE_ALT_ACTION } from '../../utils/alt-screen-owner';
+import { useWorkspaceLabels } from '../SplitPane/use-osc-title';
 import '../../styles/command-palette.css';
 
 interface CommandPaletteProps {
@@ -52,9 +54,10 @@ function fuzzyMatch(needle: string, haystack: string): boolean {
 export default function CommandPalette({ onClose, onAction }: CommandPaletteProps) {
   const {
     shortcuts, workspaces, activeWorkspaceId, selectWorkspace,
-    savedLayouts, createWorkspaceFromLayout, saveCurrentLayoutAsPreset,
+    savedLayouts, createWorkspaceFromLayout, requestLayoutSave,
   } = useStore();
   const t = useT();
+  const workspaceLabels = useWorkspaceLabels(workspaces);
 
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -146,6 +149,17 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
       },
     });
 
+    // Reset terminal state keeps the alternate screen while a program may be
+    // drawing on it (#347); this entry leaves it anyway, for a pane whose shell
+    // emits no prompt marks (#357). Routed through onAction because the focused
+    // terminal is App's to resolve, and App handles this id explicitly.
+    items.push({
+      id: 'command:reset-terminal-leave-alt',
+      label: t('palette.resetTerminalLeaveAlt', 'Reset terminal state (leave alternate screen)'),
+      category: t('palette.category.commands'),
+      action: () => onAction(RESET_TERMINAL_LEAVE_ALT_ACTION),
+    });
+
     // Category: Layouts — saved pane arrangements
     items.push({
       id: 'command:save-current-layout',
@@ -153,12 +167,12 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
       category: t('palette.category.layouts', 'Layouts'),
       action: () => {
         onClose();
-        const id = saveCurrentLayoutAsPreset(
+        const opened = requestLayoutSave(
           t('settings.workspacePanel.newLayoutName', 'Layout {n}').replace('{n}', String(savedLayouts.length + 1)),
         );
-        // null means no active workspace to capture — an edge case, but a
+        // false means no active workspace to capture — an edge case, but a
         // silent no-op here would look identical to "worked" from the palette.
-        if (!id) {
+        if (!opened) {
           (window as any).wmux?.notification?.fire({
             surfaceId: '',
             text: t('palette.saveCurrentLayoutFailed', 'No active workspace to save as a layout.'),
@@ -186,7 +200,7 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
       const currentSuffix = isCurrent ? ` (${t('palette.current')})` : '';
       items.push({
         id: `workspace:${ws.id}`,
-        label: `${ws.title}${currentSuffix}`,
+        label: `${workspaceLabels.get(ws.id) ?? ws.title}${currentSuffix}`,
         category: t('palette.category.workspaces'),
         action: () => {
           selectWorkspace(ws.id);
@@ -211,8 +225,8 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
 
     return items;
   }, [
-    shortcuts, workspaces, activeWorkspaceId, selectWorkspace, onAction, onClose, t,
-    savedLayouts, createWorkspaceFromLayout, saveCurrentLayoutAsPreset,
+    shortcuts, workspaces, workspaceLabels, activeWorkspaceId, selectWorkspace, onAction, onClose, t,
+    savedLayouts, createWorkspaceFromLayout, requestLayoutSave,
   ]);
 
   // Filter based on query

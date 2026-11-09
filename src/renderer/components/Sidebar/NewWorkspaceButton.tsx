@@ -30,6 +30,7 @@ interface NewWorkspaceButtonProps {
   onCreate: () => void;
   onCreateFromLayout: (layoutId: string) => void;
   onManageLayouts: () => void;
+  onNewWorktree?: () => void;
 }
 
 /**
@@ -37,12 +38,17 @@ interface NewWorkspaceButtonProps {
  * caret lists every saved layout. Same shape and close rules as the tab bar's
  * split-buttons (SurfaceTabBar), so it behaves the way users already know.
  */
-export default function NewWorkspaceButton({ onCreate, onCreateFromLayout, onManageLayouts }: NewWorkspaceButtonProps) {
+export default function NewWorkspaceButton({
+  onCreate,
+  onCreateFromLayout,
+  onManageLayouts,
+  onNewWorktree,
+}: NewWorkspaceButtonProps) {
   const t = useT();
   // Read from the store rather than passed in, so a layout renamed or deleted in
   // Settings while the menu is open shows up in it immediately.
   const savedLayouts = useStore((s) => s.savedLayouts);
-  const saveCurrentLayoutAsPreset = useStore((s) => s.saveCurrentLayoutAsPreset);
+  const requestLayoutSave = useStore((s) => s.requestLayoutSave);
 
   const [pos, setPos] = useState<ReturnType<typeof upwardMenuPosition> | null>(null);
   const open = pos !== null;
@@ -95,11 +101,12 @@ export default function NewWorkspaceButton({ onCreate, onCreateFromLayout, onMan
 
   const saveCurrent = () => {
     close();
-    const id = saveCurrentLayoutAsPreset(
+    // Named in a dialog before it exists (#329).
+    const opened = requestLayoutSave(
       t('settings.workspacePanel.newLayoutName', 'Layout {n}').replace('{n}', String(savedLayouts.length + 1)),
     );
     // Same as the palette command: a silent no-op would look like it worked.
-    if (!id) {
+    if (!opened) {
       (window as any).wmux?.notification?.fire({
         surfaceId: '',
         text: t('palette.saveCurrentLayoutFailed', 'No active workspace to save as a layout.'),
@@ -148,6 +155,11 @@ export default function NewWorkspaceButton({ onCreate, onCreateFromLayout, onMan
             <div className="surface-tab-menu__hint">{t('sidebar.layoutMenu.empty', 'No saved layouts yet')}</div>
           )}
           <div className="surface-tab-menu__sep" role="separator" />
+          {onNewWorktree && (
+            <button role="menuitem" onClick={() => { close(); onNewWorktree(); }}>
+              {t('sidebar.newWorktreeWorkspace', 'New worktree workspace…')}
+            </button>
+          )}
           <button role="menuitem" onClick={saveCurrent}>
             {t('palette.saveCurrentLayout', 'Save current layout as new preset')}
           </button>

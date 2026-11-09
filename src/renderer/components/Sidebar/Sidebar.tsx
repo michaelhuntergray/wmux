@@ -1,17 +1,21 @@
 import React, { useState, useCallback, useEffect } from 'react';
+import SplitDivider from '../SplitPane/SplitDivider';
 import { WorkspaceInfo, WorkspaceId, PaneId } from '../../../shared/types';
 import WorkspaceRow from './WorkspaceRow';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import WorkspaceContextMenu from './WorkspaceContextMenu';
 import SessionMenu from './SessionMenu';
 import NewWorkspaceButton from './NewWorkspaceButton';
+import NewWorktreeModal from './NewWorktreeModal';
 import OrchestrationPanel from './OrchestrationPanel';
 import AgentRosterBanner from './AgentRosterBanner';
 import type { AgentRosterEntry } from '../../store/agent-rollup';
-import { DropEdge, edgeForPointer, reorderByDrop } from './reorder';
+import { DropEdge, edgeForListPointer, edgeForPointer, reorderByDrop } from './reorder';
 import ErrorBoundary from '../ErrorBoundary';
 import { useStore } from '../../store';
+import { sidebarTextScale } from '../../store/settings-slice';
 import { useT } from '../../i18n';
+import { getStoredWorkspaceLabel } from '../SplitPane/use-osc-title';
 import '../../styles/sidebar.css';
 import '../../styles/trace.css';
 
@@ -22,6 +26,7 @@ interface ContextMenuState {
 }
 
 interface SidebarProps {
+  dockedPanel?: React.ReactNode;
   workspaces: WorkspaceInfo[];
   activeWorkspaceId: WorkspaceId | null;
   sidebarWidth: number;
@@ -50,6 +55,7 @@ interface SidebarProps {
 }
 
 export default function Sidebar({
+  dockedPanel,
   workspaces,
   activeWorkspaceId,
   sidebarWidth,
@@ -73,10 +79,15 @@ export default function Sidebar({
   onOpenAgentNavigator,
 }: SidebarProps) {
   const t = useT();
+  const rawPanelRatio = useStore((s) => s.workspacePrefs?.explorerSidebarRatio ?? 0.45);
+  const panelRatio = Number.isFinite(rawPanelRatio) ? Math.max(0.15, Math.min(0.75, rawPanelRatio)) : 0.45;
+  const textScale = useStore((s) => sidebarTextScale(s.sidebarPrefs.textScale));
   const [draggedId, setDraggedId] = useState<WorkspaceId | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: WorkspaceId; edge: DropEdge } | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [sessionMenuMode, setSessionMenuMode] = useState<'load' | 'save' | null>(null);
+  const [showWorktreeModal, setShowWorktreeModal] = useState(false);
+  const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId);
 
   // ── Orchestration IPC subscription ──────────────────────────────────────
   // Main process pushes wmux-orchestrator state.json updates; we mirror them
@@ -156,6 +167,43 @@ export default function Sidebar({
     setDropTarget(null);
   }, []);
 
+  // The list's own half of the drag (#330): a pointer below the last row, in
+  // the padding or in a gap between rows is over no row, so nothing accepted the
+  // drag and the drop was refused — "move to the end" silently did nothing. A row
+  // that handled the event has already called preventDefault, so this only acts
+  // on what fell through, and maps it onto the nearest row edge.
+  const listDropTarget = useCallback((e: React.DragEvent): { id: WorkspaceId; edge: DropEdge } | null => {
+    const rows = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[data-workspace-id]')).map((el) => {
+      const r = el.getBoundingClientRect();
+      return { id: el.dataset.workspaceId as WorkspaceId, top: r.top, height: r.height };
+    });
+    return edgeForListPointer(e.clientY, rows);
+  }, []);
+
+  const handleListDragOver = useCallback((e: React.DragEvent) => {
+    if (e.defaultPrevented || !draggedId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const target = listDropTarget(e);
+    if (!target || target.id === draggedId) {
+      setDropTarget(null);
+      return;
+    }
+    setDropTarget((prev) => (prev?.id === target.id && prev.edge === target.edge ? prev : target));
+  }, [draggedId, listDropTarget]);
+
+  const handleListDrop = useCallback((e: React.DragEvent) => {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    const target = listDropTarget(e);
+    if (draggedId && target) {
+      const reordered = reorderByDrop(workspaces.map((w) => w.id), draggedId, target.id, target.edge);
+      if (reordered) onReorder(reordered);
+    }
+    setDraggedId(null);
+    setDropTarget(null);
+  }, [draggedId, listDropTarget, workspaces, onReorder]);
+
   // Leaving the list entirely retires the marker; without this it lingers on
   // the last row hovered while the pointer is somewhere else.
   const handleListDragLeave = useCallback((e: React.DragEvent) => {
@@ -179,6 +227,17 @@ export default function Sidebar({
       if (ws) onUpdateMetadata(id, { pinned: !ws.pinned });
     },
     [workspaces, onUpdateMetadata],
+  );
+
+  // ── Save as layout preset from context menu (#329) ───────────────────────
+  // The RIGHT-CLICKED workspace, not the active one, suggested under its own
+  // name; the dialog captures the id, so nothing changes until Save.
+  const handleSaveAsLayout = useCallback(
+    (id: WorkspaceId) => {
+      const ws = workspaces.find((w) => w.id === id);
+      if (ws) useStore.getState().requestLayoutSave(getStoredWorkspaceLabel(ws), id);
+    },
+    [workspaces],
   );
 
   // ── Color from context menu ──────────────────────────────────────────────
@@ -262,22 +321,12 @@ export default function Sidebar({
   );
 
   return (
-    <div className="sidebar" style={{ width: sidebarWidth }}>
-      {/* Spacer for titlebar area + collapse button */}
-      <div className="sidebar__header">
-        {onCollapse && (
-          <button
-            className="sidebar__collapse-btn"
-            onClick={onCollapse}
-            title={t('sidebar.collapse', 'Collapse sidebar (Ctrl+B)')}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M9.78 12.78a.75.75 0 0 1-1.06 0L4.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L6.06 8l3.72 3.72a.75.75 0 0 1 0 1.06z"/>
-            </svg>
-          </button>
-        )}
-      </div>
-
+    <div
+      className="sidebar"
+      // The custom property, not a `zoom`: zoom would scale the resizable
+      // width and every icon too, while #319 asks for the TEXT only.
+      style={{ width: sidebarWidth, '--sidebar-text-scale': textScale } as React.CSSProperties}
+    >
       <ErrorBoundary label="agent-roster" silent>
         <AgentRosterBanner onFocusAgent={onFocusAgent} onOpenNavigator={onOpenAgentNavigator} />
       </ErrorBoundary>
@@ -286,7 +335,16 @@ export default function Sidebar({
         <OrchestrationPanel />
       </ErrorBoundary>
 
-      <div className="sidebar__list" onDragLeave={handleListDragLeave}>
+      <div
+        className="sidebar__list"
+        onDragOver={handleListDragOver}
+        onDrop={handleListDrop}
+        onDragLeave={handleListDragLeave}
+        onDoubleClick={(e) => {
+          // Empty list space only — never a row, its controls, or a drag.
+          if (e.button === 0 && e.target === e.currentTarget && !draggedId) onCreate();
+        }}
+      >
         {workspaces.map((ws) => (
           <WorkspaceRow
             key={ws.id}
@@ -329,6 +387,7 @@ export default function Sidebar({
           onCreate={onCreate}
           onCreateFromLayout={onCreateFromLayout}
           onManageLayouts={onManageLayouts}
+          onNewWorktree={() => setShowWorktreeModal(true)}
         />
         {sessionMenuMode && (
           <SessionMenu
@@ -344,6 +403,14 @@ export default function Sidebar({
       </div>
 
       <SidebarResizeHandle onWidthChange={handleResizeDelta} />
+      {dockedPanel && <>
+        <SplitDivider direction="vertical" onRatioChange={(delta) => {
+          useStore.getState().setWorkspacePrefs({ explorerSidebarRatio: Math.max(0.15, Math.min(0.75, panelRatio - delta)) });
+        }} />
+        <div style={{ height: `${panelRatio * 100}%`, flexShrink: 0, minHeight: 0, overflow: 'hidden' }}>
+          {dockedPanel}
+        </div>
+      </>}
 
       {contextMenu && (
         <WorkspaceContextMenu
@@ -354,6 +421,7 @@ export default function Sidebar({
           onClose={closeContextMenu}
           onPin={handlePin}
           onRename={onRename}
+          onSaveAsLayout={handleSaveAsLayout}
           onSetColor={handleSetColor}
           onSetStatusOverride={handleSetStatusOverride}
           onMoveUp={handleMoveUp}
@@ -363,6 +431,13 @@ export default function Sidebar({
           onCloseOthers={(id) => { handleCloseOthers(id); closeContextMenu(); }}
           onMarkRead={handleMarkRead}
           onMarkUnread={handleMarkUnread}
+        />
+      )}
+
+      {showWorktreeModal && (
+        <NewWorktreeModal
+          onClose={() => setShowWorktreeModal(false)}
+          cwd={activeWorkspace?.cwd}
         />
       )}
     </div>

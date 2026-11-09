@@ -20,23 +20,12 @@ const base = {
   strokeLinejoin: 'round' as const,
 };
 
-/** Help — question mark in a circle. */
-export function IconHelp({ className, size = 16 }: IconProps) {
+/** Sidebar — a window with a narrow navigation panel on the left. */
+export function IconSidebar({ className, size = 16 }: IconProps) {
   return (
     <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
-      <circle cx="12" cy="12" r="9.5" />
-      <path d="M9.2 9.2a2.9 2.9 0 0 1 5.6 1c0 1.9-2.8 2.8-2.8 2.8" />
-      <path d="M12 17.2h.01" />
-    </svg>
-  );
-}
-
-/** DevTools — angle brackets. Replaces the literal `</>` text glyph. */
-export function IconCode({ className, size = 16 }: IconProps) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
-      <path d="m16 18 6-6-6-6" />
-      <path d="m8 6-6 6 6 6" />
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
     </svg>
   );
 }
@@ -89,6 +78,52 @@ export function IconSettings({ className, size = 16 }: IconProps) {
     <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
       <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
       <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+/** File explorer (#324) — an outline folder, the same glyph every editor uses
+ *  for the side panel that lists files. */
+export function IconFolder({ className, size = 16 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.3l2 2.5h8.7A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" />
+    </svg>
+  );
+}
+
+export function IconBrowser({ className, size = 16 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <ellipse cx="12" cy="12" rx="4" ry="9" />
+      <path d="M3 12h18" />
+    </svg>
+  );
+}
+
+/** Git branch — the project Git view (#362). */
+export function IconGitBranch({ className, size = 16 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
+      <circle cx="6" cy="5" r="2" />
+      <circle cx="6" cy="19" r="2" />
+      <circle cx="18" cy="7" r="2" />
+      <path d="M6 7v10" />
+      <path d="M18 9c0 5-6 4-11.2 8.6" />
+    </svg>
+  );
+}
+
+/** Coffee cup — Keep awake (caffeine / lid) icon */
+export function IconCoffee({ className, size = 16, active = false }: IconProps & { active?: boolean }) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
+      <path d="M18 8h1a4 4 0 0 1 0 8h-1" />
+      <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" />
+      <line x1="6" y1="1" x2="6" y2="4" strokeOpacity={active ? 1 : 0.4} />
+      <line x1="10" y1="1" x2="10" y2="4" strokeOpacity={active ? 1 : 0.4} />
+      <line x1="14" y1="1" x2="14" y2="4" strokeOpacity={active ? 1 : 0.4} />
     </svg>
   );
 }

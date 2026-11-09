@@ -3,7 +3,7 @@ import { v4 as uuid } from 'uuid';
 import { WorkspaceId, WorkspaceInfo, SplitNode, SavedLayout } from '../../shared/types';
 import { isPosixPath } from '../../shared/paths';
 import { buildWorkspaceTree, WorkspaceLayout, instantiateLayout, freezeSurfaceCwds, dropEphemeralSurfaces, dropCodeContent, mergeStartupCommands } from './split-utils';
-import { killTreeTerminalPtys } from './pty-teardown';
+import { killDroppedSurfaces, killTreeTerminalPtys } from './pty-teardown';
 // The one module that owns every tab-label rule. It is pure (no React), so the
 // store importing it pulls in nothing but the label helpers.
 import { deriveWorkspaceTitle } from '../components/SplitPane/surface-label';
@@ -93,6 +93,19 @@ export interface WorkspaceSlice {
    * the user confirms the batch once instead of racing N dialogs. Runtime-only.
    */
   pendingCloseWorkspaceIds: WorkspaceId[];
+  /**
+   * The open "Save layout preset" naming dialog (#329), or null. `workspaceId`
+   * is captured when the dialog OPENS — the workspace right-clicked in the
+   * sidebar, or the active one — so switching workspaces while it is up cannot
+   * change what gets saved. Runtime-only, like the close queue above.
+   */
+  pendingLayoutSave: { workspaceId: WorkspaceId; suggestedName: string } | null;
+  /**
+   * Workspace pending close-confirmation for a Git Worktree (#7).
+   * Prompt options: Keep branch (default), Discard (delete branch), Cancel.
+   */
+  pendingCloseWorktree: WorkspaceInfo | null;
+  cancelCloseWorktree(): void;
 
   createWorkspace(options?: Partial<WorkspaceInfo>, t?: T): WorkspaceId;
   /**
@@ -121,12 +134,22 @@ export interface WorkspaceSlice {
   updateSplitTree(id: WorkspaceId, tree: SplitNode): void;
   replaceAllWorkspaces(workspaces: Array<Partial<WorkspaceInfo>>, activeIndex?: number, t?: T): void;
   /**
-   * Snapshot the active workspace's current pane arrangement (geometry, plus
+   * Snapshot the active workspace's (or `workspaceId`'s) current pane arrangement (geometry, plus
    * whatever shell/cwd/startupCommands each pane's surface already has) as a
    * new named entry in `savedLayouts`. Returns the new layout's id, or null
    * if there's no active workspace.
    */
-  saveCurrentLayoutAsPreset(name: string): string | null;
+  saveCurrentLayoutAsPreset(name: string, workspaceId?: WorkspaceId): string | null;
+  /**
+   * Open the naming dialog for a new preset (#329). Captures `workspaceId`
+   * (default: the active workspace) right now; returns false, opening nothing,
+   * when there is no such workspace — the caller reports that.
+   */
+  requestLayoutSave(suggestedName: string, workspaceId?: WorkspaceId): boolean;
+  /** Dialog Save: create the preset under `name` (trimmed, non-empty) and close. */
+  confirmLayoutSave(name: string): string | null;
+  /** Dialog Cancel / Escape: close without creating anything. */
+  cancelLayoutSave(): void;
   /**
    * Overwrite an existing `savedLayouts` entry's geometry with the active
    * workspace's current arrangement, keeping its id/name in place.
@@ -141,6 +164,12 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
   workspaces: [],
   activeWorkspaceId: null,
   pendingCloseWorkspaceIds: [],
+  pendingLayoutSave: null,
+  pendingCloseWorktree: null,
+
+  cancelCloseWorktree(): void {
+    set({ pendingCloseWorktree: null });
+  },
 
   createWorkspace(options = {}, t = identityT): WorkspaceId {
     const id: WorkspaceId = `ws-${uuid()}`;
@@ -157,6 +186,7 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
         ?? (layoutInstanceTitle(resolved.layout?.name ?? '', get().workspaces)
           || deriveWorkspaceTitle(splitTree, options.cwd, options.shell, t)
           || t('workspace.defaultTitle', 'Workspace {n}').replace('{n}', String(get().workspaces.length + 1))),
+      titleIsDefault: options.title === undefined ? true : options.titleIsDefault,
       pinned: options.pinned ?? false,
       shell: options.shell || '',
       splitTree,
@@ -183,6 +213,7 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
       ports: options.ports,
       notificationText: options.notificationText,
       shellState: options.shellState,
+      worktree: options.worktree,
     };
 
     set((state) => {
@@ -204,7 +235,7 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
       splitTree: instantiateLayout(layout.splitTree),
       // A blank layout name gives '' and must not become an explicit empty
       // title: leave it undefined so the tab-derived title applies.
-      ...(title ? { title } : {}),
+      ...(title ? { title, titleIsDefault: true } : {}),
     }, t);
   },
 
@@ -233,11 +264,26 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
         }
       }
 
-      return { workspaces: next, activeWorkspaceId: nextActiveId };
+      return {
+        workspaces: next,
+        activeWorkspaceId: nextActiveId,
+        pendingCloseWorktree: state.pendingCloseWorktree?.id === id ? null : state.pendingCloseWorktree,
+      };
     });
+    // Its notifications can no longer be read by focusing a pane, so they
+    // would sit in the bell for the life of the window (#385). The notification
+    // slice is composed beside this one at runtime; this creator is typed for
+    // its own slice only, as with workspacePrefs below.
+    (get() as unknown as { clearWorkspaceNotifications?: (wsId: WorkspaceId) => void })
+      .clearWorkspaceNotifications?.(id);
   },
 
   requestCloseWorkspace(id: WorkspaceId): void {
+    const ws = get().workspaces.find((w) => w.id === id);
+    if (ws?.worktree) {
+      set({ pendingCloseWorktree: ws });
+      return;
+    }
     // The pref lives in the settings slice; the composed store carries both
     // slices at runtime, but this creator is only typed for its own slice.
     const prefs = (get() as unknown as { workspacePrefs?: { confirmWorkspaceClose?: boolean } })
@@ -269,7 +315,13 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
 
   renameWorkspace(id: WorkspaceId, title: string): void {
     set((state) => ({
-      workspaces: state.workspaces.map((w) => (w.id === id ? { ...w, title } : w)),
+      workspaces: state.workspaces.map((w) => {
+        if (w.id !== id) return w;
+        // A chosen name stops following the window title.
+        const rest = { ...w };
+        delete rest.titleIsDefault;
+        return { ...rest, title };
+      }),
     }));
   },
 
@@ -300,6 +352,7 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
     const newWorkspaces: WorkspaceInfo[] = workspaceConfigs.map((config, i) => ({
       id: `ws-${uuid()}` as WorkspaceId,
       title: config.title ?? t('workspace.defaultTitle', 'Workspace {n}').replace('{n}', String(i + 1)),
+      titleIsDefault: config.title === undefined ? true : config.titleIsDefault,
       pinned: config.pinned ?? false,
       shell: config.shell || '',
       splitTree: config.splitTree ?? resolveDefaultSplitTree(get),
@@ -314,10 +367,13 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
       browserUrl: config.browserUrl,
       browserHistory: config.browserHistory,
       browserWidth: config.browserWidth,
+      browserPanelDocked: config.browserPanelDocked,
       explorerOpen: config.explorerOpen,
+      explorerDismissed: config.explorerDismissed,
       explorerWidth: config.explorerWidth,
       explorerExpanded: config.explorerExpanded,
       explorerShowHidden: config.explorerShowHidden,
+      worktree: config.worktree,
     }));
 
     // IDs are regenerated above, so a saved activeWorkspaceId is meaningless —
@@ -327,15 +383,44 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
         ? Math.max(0, Math.min(activeIndex, newWorkspaces.length - 1))
         : 0;
 
+    // Load session swaps the whole layout at once, so it is a close path too
+    // (#361): whatever the old layout held and the new one does not must lose
+    // its shell here, as closeWorkspace does. A startup restore has nothing to
+    // drop (the store starts empty), and a surface both layouts hold keeps its
+    // live terminal through the keep-alive host (#346).
+    killDroppedSurfaces(get().workspaces.map((w) => w.splitTree), newWorkspaces.map((w) => w.splitTree));
+
     set({
       workspaces: newWorkspaces,
       activeWorkspaceId: newWorkspaces.length > 0 ? newWorkspaces[clampedIndex].id : null,
     });
   },
 
-  saveCurrentLayoutAsPreset(name: string): string | null {
+  requestLayoutSave(suggestedName: string, workspaceId?: WorkspaceId): boolean {
     const state = get();
-    const active = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+    const id = workspaceId ?? state.activeWorkspaceId;
+    if (!id || !state.workspaces.some((w) => w.id === id)) return false;
+    set({ pendingLayoutSave: { workspaceId: id, suggestedName } });
+    return true;
+  },
+
+  confirmLayoutSave(name: string): string | null {
+    const pending = get().pendingLayoutSave;
+    const trimmed = name.trim();
+    if (!pending || !trimmed) return null;
+    const id = get().saveCurrentLayoutAsPreset(trimmed, pending.workspaceId);
+    set({ pendingLayoutSave: null });
+    return id;
+  },
+
+  cancelLayoutSave(): void {
+    set({ pendingLayoutSave: null });
+  },
+
+  saveCurrentLayoutAsPreset(name: string, workspaceId?: WorkspaceId): string | null {
+    const state = get();
+    const targetId = workspaceId ?? state.activeWorkspaceId;
+    const active = state.workspaces.find((w) => w.id === targetId);
     if (!active) return null;
 
     const settings = get() as unknown as SettingsReach;

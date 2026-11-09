@@ -57,9 +57,9 @@ event.
   one line. A missing id falls back to the renderer's own identical-text window.
 - OpenCode runs the hook for prompts a human submitted; synthetic messages,
   shell messages and compaction controls are excluded by OpenCode itself.
-- Same shared-server caveat as the session handle below: on
-  `opencode serve --service` the plugin's pane is the one that started the
-  server.
+- On a shared server (`--service`, or a `serve` without `--stdio`) the server
+  half does not report pane-specific signals at all — the TUI half handles
+  prompts and the rest from inside the pane.
 - v1 gets no prompt log; only the v2 half registers the hook.
 
 ---
@@ -67,9 +67,9 @@ event.
 ## The CLI-side (TUI) half
 
 The plugin above runs in OpenCode's **server** process. When the TUI is a
-client of a **remote server**, or of v2's shared `opencode serve --service` for
-another pane, that process has no pane's environment and none of its reports
-can be attributed — the docs above record that limit for the session handle.
+client of a **remote server**, or of v2's shared `opencode serve`, that process
+has no pane's environment and none of its reports can be attributed — the
+server half now returns a no-op for every pane-specific signal in that mode.
 
 Since the CLI-side (TUI) half exists it covers those setups: it runs in the
 TUI process, against a remote server, with the pane's `WMUX_*` environment.
@@ -117,11 +117,22 @@ wmux opencode-tui --remove   # remove, only when the file carries our marker
   every one answered, a reply to an ask the pane raised counts even after its
   session left the screen, a turn failure clears only that session's asks,
   and a replay of an ask — answered or not — never raises "Needs you" twice.
-- **Next**: working/idle from `session.execution.*` using absolute
-  `report-agent --run-depth` values; tool labels stay out.
+- **Working/idle** (plugin v4): `session.execution.started` declares
+  `report-agent --run-depth 1`; `succeeded`/`failed`/`interrupted` declare
+  `--run-depth 0`. The values are absolute, so a second producer converges
+  instead of inflating a refcount. Running sessions are tracked by id: an end
+  still clears after the user switches tabs, and a subagent's end cannot return
+  a pane to idle while its parent is still running. Tool labels stay out.
+- **Resilience** (plugin v6): a `report-session` call that never reached wmux
+  is retried after 1 s, 3 s and 10 s, so the named pipe answering *All pipe
+  instances are busy* during a restore burst no longer leaves the pane without
+  a handle for the rest of its life. A pane that starts a turn also reasserts
+  the handle it holds, throttled to once per 30 s: a handle main dropped after
+  a successful report heals on the next run rather than waiting for the user to
+  switch sessions.
 - `WMUX_PLUGIN_DEBUG` works as it does for the server half, into
   `wmux-tui-plugin-debug.log`, and logs each distinct TUI event type once —
-  the diagnostic that will pick the prompt-submission signal.
+  which is how the prompt-submission signal was identified.
 - WSL needs the same prerequisites as any wmux CLI call from inside the
   distro: `WMUX_*` arrives via `WSLENV`, and the named pipe is reached through
   `npiperelay.exe` automatically (`docs/DEVCONTAINER.md`).
@@ -172,27 +183,75 @@ empty file means OpenCode did not pick it up.
 
 ## Session handle for restore
 
-Since plugin version 7 ([#290][290]) the plugin also reports which OpenCode
-session each pane is in, so **Settings → Workspace → Resume OpenCode sessions on
-restore** can reopen it with `opencode -s <id>`. The rules, each checked
-against real `opencode-ai` 1.18.35 and `@opencode/cli` 2.0.24:
+Since plugin version 7 ([#290][290]) the plugin reports which OpenCode session
+each pane is in, so **Settings → Workspace → Resume OpenCode sessions on
+restore** can reopen it with `opencode -s <id>`. Version 10 tightens the rules:
 
-- The pane's session is the last **top-level** session anything happened in.
-  A task subagent is its own session firing events on the same pane; a session
-  born with a parent (`info.parentID` on v1, `data.parentID` on v2's flat
-  `session.created`) is never reported. `parentID` on `message.updated` is a
-  *message* id and is ignored.
-- Ids must match `ses_<base62>`; anything else is dropped here and again in
-  main and in the renderer, since the id ends up on a command line.
-- Quitting OpenCode releases the handle (`wmux release-agent --provider
-  opencode --session <id>`), so a restore gives back the shell. Main refuses
-  that release while wmux itself is quitting. OpenCode 2's `run` neither exits
-  nor disposes its plugins cleanly, so there the handle may survive a quit.
-- **OpenCode 2's shared background server reports nothing.** By default v2 runs
-  one `opencode serve --service` for every TUI, plugins live in it, and its
-  `WMUX_SURFACE_ID` names only the pane that started it — reporting from there
-  would resume pane B's conversation in pane A. Start OpenCode 2 with
-  `--standalone` for the handle to be captured.
+- **v1:** the server half reports the last **top-level** session anything
+  happened in. A task subagent is its own session firing events on the same
+  pane; a session born with a parent (`info.parentID`) is never reported.
+  `parentID` on `message.updated` is a *message* id and is ignored.
+- **v2:** the server half does **not** report session handles. The CLI-side TUI
+  half knows which session is on screen; the server half cannot tell a
+  background session from the viewed one. This also removes the last-writer
+  race between the two halves.
+- **A shared server is a hard no-op for the server half.** `--service`, and any
+  `serve` without `--stdio`, hosts multiple panes while `WMUX_SURFACE_ID` names
+  only the pane that started it. Session, activity, blocked state, prompts and
+  shell env all belong to the TUI half there. A standalone TUI's private
+  `serve --stdio` is one pane and still reports.
+- A deleted session is forgotten: `session.deleted` releases the handle, so the
+  next restore never types a dead id into `opencode -s`.
+- Ids must match `ses_<base62>` or a loop session's `ses_loop_<base62>`;
+  anything else is dropped here and again in main and in the renderer, since
+  the id ends up on a command line.
+- A report that fails is retried after 1 s, 3 s and 10 s. Only `accepted: true`
+  (or a CLI that omits the field) confirms it; `accepted: false` is a permanent
+  rejection and is logged, not retried. Each report carries an increasing
+  `--seq`, so a late report for an old session cannot overwrite a newer one.
+- A confirmed handle is reasserted when the pane starts a later turn, at most
+  once per 30 s. That heals a handle main dropped after a successful report
+  (a late PTY clear, or an exit release racing the next OpenCode in the tab).
+- A real OpenCode exit releases the handle synchronously. A plugin dispose or
+  reload waits 1.5 s for a replacement instance to cancel it, so updating the
+  plugin does not clear every open private-server handle. Main refuses the
+  release while wmux itself is quitting.
+- Every CLI call has a 10 s timeout, so a hung CLI cannot leave a report in
+  flight forever.
+- **OpenCode 2's shared background server cannot attribute a pane.** By default
+  v2 runs one `opencode serve --service` for every TUI, plugins live in it, and
+  its `WMUX_SURFACE_ID` names only the pane that started it. The CLI-side TUI
+  half (`wmux opencode-tui`) runs in the TUI process instead, so it captures the
+  viewed session, prompts, blocked state and working/idle for remote and shared
+  servers. Run the installer after a wmux update so the installed marker
+  matches.
+- The CLI also retries **idempotent report verbs** — `report-session`,
+  `report-agent`, `report-metadata`, `report-subagent`, `release-agent` and the
+  prompt `hook` — when the named pipe is busy or drops before a reply. A spawn
+  or a typed key never takes that path, so a retry cannot duplicate real work.
+
+---
+
+## Links
+
+wmux sets `BROWSER=wmux-open-url` in WSL panes. The shim calls `wmux open`,
+which goes through the same destination rule as a terminal link click: the panel
+by default, the system browser when **Settings → Browser → Open links in the
+system browser** is on.
+
+- Codex already honours `$BROWSER` through the Rust `webbrowser` crate, so its
+  plain link clicks land in the panel as soon as a wmux build with the shim is
+  running.
+- OpenCode needs `$BROWSER` support in its own opener (OpenCode issue
+  [#58526](https://github.com/anomalyco/opencode/issues/58526)). Until that
+  ships, plain clicks in an OpenCode pane still open the system browser and
+  Ctrl+click is the way to the panel.
+- Mouse capture, wheel forwarding and touch-pan gain are unchanged: this routes
+  where a link opens, not how the pane scrolls.
+- `wmux-open-url` resolves through PATH, which relies on WSL's default
+  `appendWindowsPath` interop — the same mechanism that makes `wmux` itself
+  runnable in the pane. If interop is disabled, links fall back to the system
+  browser.
 
 ---
 
@@ -201,7 +260,7 @@ against real `opencode-ai` 1.18.35 and `@opencode/cli` 2.0.24:
 The first line of `wmux.js` is a marker:
 
 ```js
-// wmux-plugin-version: 4
+// wmux-plugin-version: 10
 ```
 
 wmux compares it against the installed copy on every launch and overwrites when

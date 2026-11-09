@@ -40,6 +40,15 @@ const provider = providerIndex === -1 ? '' : (argv[providerIndex + 1] ?? '');
 const isQwen = provider === 'qwen';
 
 /**
+ * Where the agent that fired this hook keeps its transcripts. Only the WSL
+ * helper says (`wmux-hook-wsl.sh` appends `--host wsl`, #428): that session's
+ * transcript is in the distro's ~/.claude, which the startup prune cannot read,
+ * so main must not judge it against the Windows one.
+ */
+const hostIndex = argv.indexOf('--host');
+const isWslHost = hostIndex !== -1 && argv[hostIndex + 1] === 'wsl';
+
+/**
  * When Claude Code fired this hook, near enough (issue #151).
  *
  * Taken at process start rather than at send time because the interesting delay
@@ -246,6 +255,12 @@ interface HookPayloadFields {
   agentId: string;
   agentType: string;
   /**
+   * Claude Code's `tool_use_id` on PreToolUse/PostToolUse (#399). Pairs a
+   * tool's start with its end, which is how wmux tells that the call a
+   * permission prompt stood for has run.
+   */
+  toolUseId: string;
+  /**
    * A shell Claude Code moved to the background (issue #276): the Bash or
    * PowerShell tool's `tool_response.backgroundTaskId`, set both for
    * `run_in_background` and for a command the user backgrounded with Ctrl+B.
@@ -401,18 +416,22 @@ function readBackgroundTasks(data: Record<string, any>, toolInput: any, toolName
     out.bgTasksEnded = endedTaskIds(data.prompt).join(',');
   }
   if (out.agentId && (event === 'PreToolUse' || event === 'SubagentStop')) {
-    const ended = subagentEndedTaskIds(subagentTranscriptPath(data, out.agentId));
-    if (ended.length) {
-      // Keep a TaskStop from this call, then the NEWEST endings. Every hook
-      // rereads the same tail, so keeping the oldest would drop a fresh ending
-      // on every call until older records scrolled out of the tail.
-      const stopped = out.bgTasksEnded.split(',').filter(Boolean);
-      const room = MAX_TASK_NOTIFICATIONS - stopped.length;
-      const newest = ended.filter((id) => !stopped.includes(id)).slice(-room);
-      out.bgTasksEnded = [...stopped, ...newest].join(',');
-    }
+    addSubagentEndedTasks(data, out);
   }
   if (event === 'SessionStart' && data.source === 'startup') out.freshSession = true;
+}
+
+/** Background tasks a subagent's transcript tail says have ended. */
+function addSubagentEndedTasks(data: Record<string, any>, out: HookPayloadFields): void {
+  const ended = subagentEndedTaskIds(subagentTranscriptPath(data, out.agentId));
+  if (!ended.length) return;
+  // Keep a TaskStop from this call, then the NEWEST endings. Every hook
+  // rereads the same tail, so keeping the oldest would drop a fresh ending
+  // on every call until older records scrolled out of the tail.
+  const stopped = out.bgTasksEnded.split(',').filter(Boolean);
+  const room = MAX_TASK_NOTIFICATIONS - stopped.length;
+  const newest = ended.filter((id) => !stopped.includes(id)).slice(-room);
+  out.bgTasksEnded = [...stopped, ...newest].join(',');
 }
 
 /**
@@ -464,7 +483,7 @@ function adaptQwenFields(data: Record<string, any>, out: HookPayloadFields): voi
 function parsePayload(raw: string): HookPayloadFields {
   const out: HookPayloadFields = {
     file: '', message: '', sessionId: '', toolName: '', prompt: '', notificationType: '', subagent: false,
-    agentId: '', agentType: '', bgTask: '', bgTaskDetail: '', bgTasksEnded: '', freshSession: false,
+    agentId: '', agentType: '', toolUseId: '', bgTask: '', bgTaskDetail: '', bgTasksEnded: '', freshSession: false,
   };
   if (!raw.trim()) return out;
   let data: Record<string, any>;
@@ -524,6 +543,11 @@ function readPayloadFields(data: Record<string, any>, out: HookPayloadFields): v
     out.agentId = data.agent_id;
     if (typeof data.agent_type === 'string' && AGENT_IDENT_RE.test(data.agent_type)) out.agentType = data.agent_type;
   }
+  // Not from a Grok subagent's own session: it carries no `agent_id`, so wmux
+  // would take its tool calls for the main thread's (#399).
+  if (!out.subagent && typeof data.tool_use_id === 'string' && AGENT_IDENT_RE.test(data.tool_use_id)) {
+    out.toolUseId = data.tool_use_id;
+  }
   // UserPromptSubmit carries what the user actually typed, and wmux threw it
   // away — which is why the prompt-log features in issue #207 had no source of
   // truth for an agent pane. It cannot be recovered from the screen: an agent
@@ -572,10 +596,10 @@ function reportedEvent(fired: string, subagent: boolean): string | null {
 
 /** The `hook.event` params: only the fields that carry something. */
 function hookParams(fields: HookPayloadFields): Record<string, string | number> {
-  const { file, message, sessionId, prompt, notificationType, agentId, agentType, bgTask, bgTaskDetail, bgTasksEnded } = fields;
+  const { file, message, sessionId, prompt, notificationType, agentId, agentType, toolUseId, bgTask, bgTaskDetail, bgTasksEnded } = fields;
   const params: Record<string, string | number> = { at: firedAt };
   const optional: Record<string, string> = {
-    event, tool, file, message, notificationType, prompt, agentId, agentType, surfaceId,
+    event, tool, file, message, notificationType, prompt, agentId, agentType, toolUseId, surfaceId,
     bgTask, bgTaskDetail, bgTasksEnded, freshSession: fields.freshSession ? '1' : '',
     // Not under Grok (it sets GROK_HOOK_EVENT on every hook process). Grok
     // 1.0.44 sends `session_id` alongside `sessionId`, and an id recorded here
@@ -585,6 +609,8 @@ function hookParams(fields: HookPayloadFields): Record<string, string | number> 
     // Whose session id that is: main files it under this provider and restores
     // it with that agent's resume command. Absent means Claude.
     provider: isQwen ? 'qwen' : '',
+    // Whose disk that session's transcript is on (#428). Absent means Windows.
+    host: isWslHost ? 'wsl' : '',
   };
   for (const [key, value] of Object.entries(optional)) {
     if (value) params[key] = value;

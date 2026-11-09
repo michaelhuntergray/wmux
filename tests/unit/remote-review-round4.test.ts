@@ -196,10 +196,11 @@ describe('Settings (#254)', () => {
     }
   });
 
-  it('CLAUDE.md lists the dismiss-rejected-origin bridge', () => {
-    // MIC-34 moved these lists verbatim from CLAUDE.md into docs/dev/.
-    expect(read('docs/dev/architecture.md')).toMatch(/remoteConsole:[^\n]*\n[^\n]*dismissRejectedOrigin/);
-    expect(read('docs/dev/ipc-and-shell-integration.md')).toContain('rename-device/dismiss-rejected-origin');
+  it('the preload exposes the dismiss-rejected-origin bridge', () => {
+    // AGENTS.md no longer copies the bridge or channel lists; the preload and
+    // IPC_CHANNELS are their one homes.
+    expect(read('src/preload/index.ts')).toContain('dismissRejectedOrigin: () =>');
+    expect(read('src/shared/types.ts')).toContain("'remote-console:dismiss-rejected-origin'");
   });
 });
 

@@ -304,8 +304,31 @@ describe('surface-slice', () => {
         path.join(__dirname, '..', '..', 'src', 'renderer', 'hooks', 'useTerminal.ts'),
         'utf8',
       );
-      const exitHandler = hook.slice(hook.indexOf('window.wmux.pty.onExit('));
-      expect(exitHandler).toMatch(/clearPrForSurface\(id/);
+      const exitHandler = hook.match(/const onExit = \(_code: number\) => \{([\s\S]*?)\n {6}\};/);
+      expect(exitHandler).not.toBeNull();
+      expect(exitHandler?.[1]).toMatch(/clearPrForSurface\(id/);
+
+      const exitSubscriptions = hook.match(/if \(retained\) \{([\s\S]*?)\n {6}\} else \{([\s\S]*?)\n {6}\}/);
+      expect(exitSubscriptions).not.toBeNull();
+      expect(exitSubscriptions?.[1]).toMatch(/retained\.attach\(onData, onExit,/);
+      expect(exitSubscriptions?.[2]).toMatch(/window\.wmux\.pty\.onExit\(id, onExit\)/);
+    });
+  });
+
+  describe('addSurface', () => {
+    it('makes the new tab active by default', () => {
+      useStore.getState().addSurface(workspaceId, paneId, 'browser', { url: 'https://a.example/' });
+      expect(currentLeaf().activeSurfaceIndex).toBe(1);
+    });
+
+    // Ctrl+click or middle-click on a link in the browser panel opens it the
+    // way a browser does: in a new tab, leaving the user on the page they were.
+    it('leaves the active tab alone for a background open', () => {
+      const id = useStore.getState().addSurface(workspaceId, paneId, 'browser', { url: 'https://a.example/', background: true })!;
+      const leaf = currentLeaf();
+      expect(leaf.activeSurfaceIndex).toBe(0);
+      expect(leaf.surfaces.map((s) => s.id)).toContain(id);
+      expect(leaf.surfaces.find((s) => s.id === id)?.url).toBe('https://a.example/');
     });
   });
 

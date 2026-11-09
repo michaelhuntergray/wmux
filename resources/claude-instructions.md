@@ -3,8 +3,8 @@
 # wmux
 
 wmux is a terminal multiplexer with a browser panel on the right that the user
-watches in real time. It writes this section into a **global** agent-context
-file, so every session on this machine loads it — including sessions that are
+watches in real time. It installs this guidance **globally** (an agent-context
+file or a skill), so it reaches every session on this machine — including sessions that are
 not running inside wmux at all (a desktop app, a plain terminal, CI, an SSH
 session, a scheduled run). Whether it applies to you is a fact about *your*
 session, so check it rather than assume it:
@@ -105,10 +105,10 @@ wmux report-agent --unblocked
 
 ## Subagents and background tasks
 
-Claude Code's own subagents appear under your pane in the sidebar on their
-own. If you run work of your own in the background — a worker, a planner, a
-long task that outlives your turn — declare it, so the pane does not read idle
-while it runs. Same id to update (each call is a heartbeat), `--done` to finish:
+Subagents that wmux already tracks through your agent's integration appear
+under your pane in the sidebar on their own. If you run work of your own in
+the background — a worker, a planner, a long task that outlives your turn —
+declare it, so the pane does not read idle while it runs. Same id to update (each call is a heartbeat), `--done` to finish:
 
 ```bash
 wmux report-subagent planner-1 --name planner --detail "calling create_file"

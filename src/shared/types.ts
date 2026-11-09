@@ -20,7 +20,7 @@ export type SplitNode =
  * actually requires. Both drive the same per-surface prompt log, so neither is a
  * second implementation of anything.
  */
-export type SurfaceType = 'terminal' | 'browser' | 'markdown' | 'diff' | 'code' | 'prompts';
+export type SurfaceType = 'terminal' | 'browser' | 'markdown' | 'diff' | 'code' | 'prompts' | 'git' | 'explorer';
 
 /**
  * Which engine backs a `browser` surface.
@@ -34,6 +34,37 @@ export type SurfaceType = 'terminal' | 'browser' | 'markdown' | 'diff' | 'code' 
  * migration (session-persistence.ts superset rule, #145).
  */
 export type BrowserEngine = 'web' | 'agent';
+
+export interface WorktreeMetadata {
+  repoRoot: string;      // the MAIN checkout, not this one
+  branch: string;
+  baseBranch: string;
+  baseSha: string;       // D6 — the name moves, the SHA does not
+  worktreePath: string;  // always under the wmux root; nothing else is removable
+}
+
+/**
+ * How the close dialog ends a worktree workspace (#366). `keep` removes the
+ * checkout only when git status (ignored files included) lists nothing and
+ * never touches the branch; `discard` force-removes it and deletes the branch
+ * main recorded. Anything else leaves the directory on disk.
+ */
+export type WorktreeCloseMode = 'keep' | 'discard';
+
+export interface WorktreeRemoveResult {
+  outcome: 'removed' | 'has-work' | 'not-ours' | 'absent' | 'left-behind' | 'error';
+  /** Entries git status listed, for `has-work`. */
+  count?: number;
+  /** Discard only: whether `git branch -D` succeeded. */
+  branchDeleted?: boolean;
+  message?: string;
+}
+
+export interface WorktreeInspectResult {
+  outcome: 'clean' | 'has-work' | 'not-ours' | 'absent' | 'error';
+  count?: number;
+  message?: string;
+}
 
 export interface SurfaceRef {
   id: SurfaceId;
@@ -61,6 +92,12 @@ export interface SurfaceRef {
    * all can still say "PowerShell" rather than "Terminal".
    */
   resolvedShell?: string;
+  /**
+   * Effective launch spec captured when the PTY starts, including an inherited
+   * workspace/default spec's arguments. New terminals inherit it rather than
+   * re-reading preferences that may have changed since this terminal started.
+   */
+  launchShell?: string;
   /** Per-surface color scheme override (bundled theme name or user-defined scheme name). */
   colorScheme?: string;
   /** Per-surface working directory override (quick-launch profiles — issue #32). */
@@ -85,6 +122,13 @@ export interface SurfaceRef {
    * `claude --resume <id>` prepended to its startup commands.
    */
   claudeSessionId?: string;
+  /**
+   * Where `claudeSessionId`'s transcript lives when it is not on Windows: `wsl`
+   * for a Claude that ran inside a WSL pane (#428). The startup prune reads
+   * only the Windows `~/.claude/projects`, so it keeps a `wsl` id rather than
+   * calling it dead. Stamped and removed together with the id.
+   */
+  claudeSessionHost?: 'wsl';
   /** Exact Codex conversation to resume, independently of Claude. */
   codexSessionId?: string;
   /**
@@ -111,6 +155,12 @@ export interface SurfaceRef {
    * `workspacePrefs.restoreOmpSessions` is on.
    */
   ompSessionId?: string;
+  /**
+   * pi session FILE to resume (#382), stamped by `stampPiSessionFiles` from
+   * what wmux's pi extension reported. Restored as `pi --session <path>` when
+   * `workspacePrefs.restorePiSessions` is on.
+   */
+  piSessionFile?: string;
   /** Initial URL for a browser surface created from a quick-launch profile (issue #32). */
   url?: string;
   /** A browser surface's back/forward stack, restored on mount (#315). See shared/browser-history.ts. */
@@ -138,6 +188,19 @@ export interface SurfaceRef {
    *  surface (issue #116). Persisted for the same reason as `markdownContent`:
    *  split-tree restructures remount the pane and would otherwise reset it. */
   markdownViewMode?: 'preview' | 'source';
+
+  // ─── Project Git view (#362) ───────────────────────────────────────────────
+  // The repository itself is `cwd` (pinned when the tab opens, like a Diff tab
+  // opened from the explorer). These are the review CONTEXT, persisted so a
+  // split-tree remount or a restart keeps it — and, the point of the request,
+  // so focusing another agent's pane never moves it.
+
+  /** Worktree under review (path as `git worktree list` prints it). */
+  gitWorktree?: string;
+  /** Base of the branch review (`develop`, `origin/main`, …). */
+  gitBase?: string;
+  gitMode?: 'working' | 'branch' | 'graph';
+  gitGraphScope?: 'all' | 'local' | 'worktree';
   /** mtime of the backing file as of the last successful load or save (F3).
    *  Compared before overwriting so an agent rewriting the file under the pane
    *  is caught instead of silently losing to whoever saves last. */
@@ -184,6 +247,8 @@ export interface SurfaceRef {
    * as-is), so the terminal this points at is the same one after a restart.
    */
   codeRootSurfaceId?: SurfaceId;
+  /** Terminal whose jailed directory this dockable explorer follows (#405). */
+  explorerRootSurfaceId?: SurfaceId;
   /**
    * The file's text. In-store only — STRIPPED by dropCodeContent before any
    * persistence, unlike markdownContent which is deliberately persisted.
@@ -275,6 +340,12 @@ export type ExplorerErrorCode =
 export interface ExplorerListError { error: string; code: ExplorerErrorCode }
 
 export type ExplorerListResult = ExplorerListOk | ExplorerListError;
+
+export type TerminalFileLinkTarget =
+  | { kind: 'jailed'; relPath: string; absPath: string; name: string; viewable: boolean }
+  | { kind: 'markdown'; absPath: string; name: string };
+
+export type TerminalFileLinkResult = TerminalFileLinkTarget | ExplorerListError;
 
 /**
  * One changed file, as the explorer's +N/-N column consumes it.
@@ -387,6 +458,13 @@ export interface QuickLaunchProfile {
 export interface WorkspaceInfo {
   id: WorkspaceId;
   title: string;
+  /**
+   * True when wmux picked `title` (`Workspace N`, a layout instance, the
+   * tab-derived name) rather than a person or a caller. Only such a name gives
+   * way to the window title a terminal's program sets; a rename clears it.
+   * Absent on sessions saved before it existed, so their names stay fixed.
+   */
+  titleIsDefault?: boolean;
   customColor?: string;
   pinned: boolean;
   shell: string;
@@ -395,14 +473,16 @@ export interface WorkspaceInfo {
   gitBranch?: string;
   gitDirty?: boolean;
   cwd?: string;
-  // The last POSIX/WSL directory known for this workspace, kept apart from
-  // `cwd` because one workspace can hold panes in two filesystems at once.
-  // `cwd` is whichever pane reported last, so a single pwsh/cmd pane rewrites
-  // it to a Win32 path — and a WSL pane with no cwd of its own then falls back
-  // to a path wsl.exe cannot open, so `--cd` degrades to `~` and the pane
-  // silently lands in the WSL home instead of the project. Only POSIX reports
-  // (and a POSIX folder at creation) write here, so the WSL fallback survives
-  // a Win32 pane living in the same workspace.
+  /**
+   * Git worktree metadata if this workspace is an isolated worktree.
+   * Note: this is NOT cwd: cwd is rewritten by report_pwd on every prompt (§5.3),
+   * so an agent running cd .. moves it.
+   */
+  worktree?: WorktreeMetadata;
+  /**
+   * The WSL fallback survives a neighbouring Windows pane's cwd report. May be
+   * POSIX, a drive path or WSL UNC: wsl.exe --cd accepts all three spellings.
+   */
   posixCwd?: string;
   prNumber?: number;
   prStatus?: 'open' | 'merged' | 'closed';
@@ -425,7 +505,15 @@ export interface WorkspaceInfo {
   /** The side panel's back/forward stack (#315), kept beside browserUrl. */
   browserHistory?: BrowserHistory;
   browserWidth?: number;
+  /** The side browser was promoted to a tile; startup must not duplicate it. */
+  browserPanelDocked?: boolean;
   explorerOpen?: boolean;
+  /**
+   * The user closed the explorer while `explorerOpenByDefault` was on (#320).
+   * That pref otherwise reopens the panel on every workspace switch, so the
+   * close is remembered separately from `explorerOpen`; reopening clears it.
+   */
+  explorerDismissed?: boolean;
   explorerWidth?: number;
   /** Expanded dirs by root path, POSIX separators. Capped at 8 roots, LRU. */
   explorerExpanded?: Record<string, string[]>;
@@ -557,6 +645,7 @@ export interface SavedSession {
   savedAt: number;
   workspaces: Array<{
     title: string;
+    titleIsDefault?: boolean;
     customColor?: string;
     shell: string;
     cwd: string;
@@ -571,9 +660,11 @@ export interface SavedSession {
     // Both written since 0.4x; declared here as of #145, which was caused by a
     // save path quietly dropping fields the type never mentioned.
     browserWidth?: number;
+    browserPanelDocked?: boolean;
     // Declared here for the same reason browserWidth is: #145 was a save path
     // quietly dropping fields the type never mentioned.
     explorerOpen?: boolean;
+    explorerDismissed?: boolean;
     explorerWidth?: number;
     explorerExpanded?: Record<string, string[]>;
     explorerShowHidden?: boolean;
@@ -616,16 +707,31 @@ export interface InsertionResult {
   failure?: { destination: string; detail: string };
 }
 
+/** Only final saves carry a token and the single main-owned shutdown deadline. */
+export interface SessionSaveRequest {
+  token: string;
+  deadline: number;
+}
+
 // IPC channel names
 export const IPC_CHANNELS = {
+  DICTATION_COMMAND: 'dictation:command',
+  DICTATION_STATE: 'dictation:state',
   // PTY
   PTY_CREATE: 'pty:create',
   PTY_WRITE: 'pty:write',
   PTY_RESIZE: 'pty:resize',
+  PTY_CLEAR: 'pty:clear',
   PTY_KILL: 'pty:kill',
   PTY_HAS: 'pty:has',
   PTY_DATA: 'pty:data',
   PTY_EXIT: 'pty:exit',
+  TERMINAL_HISTORY_STATE: 'terminal-history:state',
+  TERMINAL_HISTORY_GET_STATE: 'terminal-history:get-state',
+  TERMINAL_HISTORY_SET_ENABLED: 'terminal-history:set-enabled',
+  TERMINAL_HISTORY_BINDING: 'terminal-history:binding',
+  TERMINAL_HISTORY_READ: 'terminal-history:read',
+  TERMINAL_HISTORY_CHECKPOINT: 'terminal-history:checkpoint',
   // Remote file upload (ssh panes) — main resolves the whole paste/drop
   REMOTE_RESOLVE_PASTE: 'remote:resolve-paste',
   REMOTE_RESOLVE_DROP: 'remote:resolve-drop',
@@ -651,6 +757,7 @@ export const IPC_CHANNELS = {
   PANE_CLOSE: 'pane:close',
   PANE_FOCUS: 'pane:focus',
   PANE_ZOOM: 'pane:zoom',
+  WINDOW_ZOOM: 'window:zoom',
   PANE_LIST: 'pane:list',
   // Notification
   NOTIFICATION_FIRE: 'notification:fire',
@@ -684,6 +791,11 @@ export const IPC_CHANNELS = {
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   SETTINGS_CHANGED: 'settings:changed',
+  // Keep Awake
+  AWAKE_GET_STATE: 'awake:getState',
+  AWAKE_SET_MODE: 'awake:setMode',
+  AWAKE_SET_PREVENT_DISPLAY_SLEEP: 'awake:setPreventDisplaySleep',
+  AWAKE_STATE_CHANGED: 'awake:stateChanged',
   // Window
   WINDOW_CREATE: 'window:create',
   WINDOW_CLOSE: 'window:close',
@@ -738,6 +850,7 @@ export const IPC_CHANNELS = {
   // CDP (browser.* pipe methods map to these internal IPC channels)
   CDP_ATTACH: 'cdp:attach',
   CDP_DETACH: 'cdp:detach',
+  BROWSER_FOCUS_DEVTOOLS: 'browser:focus-devtools',
   CDP_NAVIGATE: 'cdp:navigate',
   CDP_SNAPSHOT: 'cdp:snapshot',
   CDP_CLICK: 'cdp:click',
@@ -777,6 +890,24 @@ export const IPC_CHANNELS = {
    * guest hosted by the window that asks.
    */
   BROWSER_GET_HISTORY: 'browser:get-history',
+  /**
+   * A shortcut-shaped key pressed inside a browser pane's page (main → the
+   * window hosting that guest). The page keeps the key; the desktop decides
+   * whether one of its tab-level actions answers it. See webview-guest-keys.ts.
+   */
+  BROWSER_GUEST_KEY: 'browser:guest-key',
+  /**
+   * Pop the browser panel's right-click menu (#439) over the asking window
+   * (renderer → main, invoke). Takes labelled items, answers the chosen
+   * action or null. See shared/browser-context-menu.ts.
+   */
+  BROWSER_CONTEXT_MENU: 'browser:context-menu',
+  /**
+   * main → host window: a browser pane's guest asked to open a link in a new
+   * tab (Ctrl+click or middle-click). Carries the guest's webContentsId, so the
+   * pane hosting that guest is the one that answers, and the http(s) url.
+   */
+  BROWSER_OPEN_IN_NEW_TAB: 'browser:open-in-new-tab',
   // Active workspace query (renderer → main)
   GET_ACTIVE_WORKSPACE: 'get-active-workspace',
   // Hook events (Claude Code hooks → main → renderer)
@@ -785,9 +916,13 @@ export const IPC_CHANNELS = {
   CLAUDE_ACTIVITY: 'claude:activity',
   // Declared agent run state (pane.report_agent → main → renderer, issue #128)
   AGENT_STATE: 'agent:state',
-  // Named sessions
+  // Automatic and named sessions
+  SESSION_REQUEST: 'session:request',
+  SESSION_SAVE: 'session:save',
+  SESSION_HISTORY_DONE: 'session:history-done',
   SESSION_SAVE_NAMED: 'session:save-named',
   SESSION_LOAD_NAMED: 'session:load-named',
+  SESSION_LOAD_STARTUP_FALLBACK: 'session:load-startup-fallback',
   SESSION_LIST_NAMED: 'session:list-named',
   /** Pick a wmux.workspace.json and open it (#284). Main does all of it. */
   WORKSPACE_FILE_OPEN: 'workspace-file:open',
@@ -798,6 +933,8 @@ export const IPC_CHANNELS = {
   DIFF_GET_FILES: 'diff:get-files',
   DIFF_GET_DIFF: 'diff:get-diff',
   DIFF_UPDATE: 'diff:update',
+  // The project Git view (#362): one tagged, read-only request per call.
+  GIT_VIEW: 'git:view',
   // Markdown viewer (issue #54) — file picker for the manual "open markdown" UI
   MARKDOWN_OPEN_FILE: 'markdown:open-file',
   // Markdown viewer (issue #116) — path-aware surfaces: re-read a known file
@@ -812,6 +949,10 @@ export const IPC_CHANNELS = {
   MARKDOWN_SAVE_FILE: 'markdown:save-file',
   MARKDOWN_SAVE_AS: 'markdown:save-as',
   MARKDOWN_STAT_FILE: 'markdown:stat-file',
+  // Issue #380 — a local image a markdown document names, read by main and
+  // returned as a data: URL. Image types only, by extension AND bytes; see
+  // main/markdown-image.ts for why the document path is a base, not a grant.
+  MARKDOWN_READ_IMAGE: 'markdown:read-image',
   // File explorer: directory enumeration, jailed to the surface's root in main.
   EXPLORER_LIST_DIR: 'explorer:list-dir',
   // Per-file change counts for the tree's +N/-N column. Takes a surfaceId and
@@ -834,6 +975,11 @@ export const IPC_CHANNELS = {
   // every ordinary source file the tree now offers.
   EXPLORER_REVEAL: 'explorer:reveal',
   EXPLORER_OPEN_IN_APP: 'explorer:open-in-app',
+  TERMINAL_RESOLVE_FILE_LINK: 'terminal:resolve-file-link',
+  // OSC 7 cwd report from a terminal's own output (#378). Takes the RAW
+  // payload: main parses and gates it, so the allow-list sits on the trusted
+  // side. Answers the accepted Windows path, or null.
+  EXPLORER_REPORT_OSC7: 'explorer:report-osc7',
   // Orchestration (wmux-orchestrator plugin state broadcast)
   ORCHESTRATION_UPDATE: 'orchestration:update',
   ORCHESTRATION_CLEAR: 'orchestration:clear',
@@ -867,6 +1013,11 @@ export const IPC_CHANNELS = {
   // receives the surface's PTY_DATA so the snapshot is ordered against it.
   REMOTE_RENDERER_REQUEST: 'remote-console:renderer-request',
   REMOTE_RENDERER_REPLY: 'remote-console:renderer-reply',
+  // Git worktree
+  GIT_WORKTREE_CREATE: 'git-worktree:create',
+  GIT_WORKTREE_REMOVE: 'git-worktree:remove',
+  GIT_WORKTREE_PROBE: 'git-worktree:probe',
+  GIT_WORKTREE_INSPECT: 'git-worktree:inspect',
 } as const;
 
 /**
@@ -955,4 +1106,14 @@ export interface OrchestrationState {
 export function engineOf(surface: { type: SurfaceType; browserEngine?: BrowserEngine }): BrowserEngine {
   if (surface.type !== 'browser') return 'web';
   return surface.browserEngine === 'agent' ? 'agent' : 'web';
+}
+
+/** Keep Windows awake (issue #363). Owned and persisted by main's awake-manager.ts. */
+export type KeepAwakeMode = 'smart' | 'always' | 'off';
+
+export interface KeepAwakeState {
+  mode: KeepAwakeMode;
+  isActive: boolean;
+  preventDisplaySleep: boolean;
+  blockerType: 'prevent-app-suspension' | 'prevent-display-sleep';
 }

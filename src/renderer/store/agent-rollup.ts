@@ -30,7 +30,7 @@ import type { AgentChoiceView } from './claude-session-view';
  * never spoke is exactly the lie the protocol exists to prevent. This is also
  * the slot screen detection fills in later.
  */
-export type AgentPresenceState = 'blocked' | 'working' | 'idle' | 'unknown';
+export type AgentPresenceState = 'blocked' | 'question' | 'working' | 'idle' | 'unknown';
 
 /** Which agent is running, and how confident we are about that. */
 export interface AgentIdentitySnapshot {
@@ -48,6 +48,10 @@ export interface AgentIdentitySnapshot {
 export interface DetectionSnapshot {
   agent: string | null;
   state: AgentPresenceState;
+  /** When the renderer published this verdict. Absent → it cannot be placed in time. */
+  observedAt?: number;
+  /** The declared session on the surface when it was published, if any. */
+  sessionId?: string | null;
 }
 
 /**
@@ -75,6 +79,21 @@ export interface DeclaredAgentSnapshot {
   answeredAt?: number | null;
   /** Last accepted report of ANY kind, including metadata-only ones. */
   updatedAt?: number;
+  /** The agent session main has on record for this surface. */
+  sessionId?: string | null;
+  /**
+   * Whose session that is (`claude`, `qwen`, …), as the agent's own hooks said.
+   * The roster's last-resort kind: Qwen Code has neither a process identity nor
+   * a detection manifest, so without it a reporting Qwen pane was listed under
+   * its folder name — and a pane that reported nothing at all was not listed.
+   */
+  sessionProvider?: string | null;
+  /**
+   * When this surface's current idle period began, stamped by the renderer on
+   * the transition INTO idle (see withIdleSince). Not `updatedAt`: that moves
+   * on every metadata report, so it cannot say when a turn ended.
+   */
+  idleSince?: number;
   /**
    * When this pane became blocked, if main stamped it. Distinct from
    * `updatedAt` because a blocked agent that keeps reporting token counts would
@@ -89,6 +108,10 @@ export interface AgentRosterEntry {
   surfaceId: SurfaceId;
   paneId: PaneId;
   workspaceId: WorkspaceId;
+  /**
+   * What the workspace is called: its label from `rollupAgents`'
+   * `workspaceLabels` (the sidebar's name, #343), else its stored title.
+   */
   workspaceTitle: string;
   /** User-set tab title, else the pane cwd's folder name. */
   label: string;
@@ -121,11 +144,13 @@ export interface AgentRosterEntry {
 
 export interface AgentCounts {
   blocked: number;
+  /** Finished its turn on an ordinary question; nothing to approve. */
+  question: number;
   working: number;
   idle: number;
   /** Identified, but silent about what it is doing. */
   unknown: number;
-  /** Agents present, i.e. blocked + working + idle + unknown. Not the pane count. */
+  /** Agents present, i.e. blocked + question + working + idle + unknown. Not the pane count. */
   total: number;
 }
 
@@ -174,7 +199,7 @@ function cwdBasename(cwd: string | undefined): string | null {
   return base || null;
 }
 
-const EMPTY_COUNTS = (): AgentCounts => ({ blocked: 0, working: 0, idle: 0, unknown: 0, total: 0 });
+const EMPTY_COUNTS = (): AgentCounts => ({ blocked: 0, question: 0, working: 0, idle: 0, unknown: 0, total: 0 });
 
 /**
  * One surface → one roster entry, or null when no agent claimed it.
@@ -186,6 +211,7 @@ const EMPTY_COUNTS = (): AgentCounts => ({ blocked: 0, working: 0, idle: 0, unkn
 function rosterEntryFor(
   surface: SurfaceEntry,
   workspace: WorkspaceInfo,
+  workspaceTitle: string,
   declared: DeclaredAgentSnapshot | undefined,
   identity: AgentIdentitySnapshot | undefined,
   detection: DetectionSnapshot | undefined,
@@ -193,7 +219,7 @@ function rosterEntryFor(
 ): AgentRosterEntry | null {
   const declaredState = declared && declared.state !== 'unknown' ? declared.state : null;
   const detectedState = detection && detection.state !== 'unknown' ? detection.state : null;
-  const kind = identity?.kind ?? detection?.agent ?? null;
+  const kind = identity?.kind ?? detection?.agent ?? (declared?.sessionId ? declared.sessionProvider : null) ?? null;
 
   // Three independent ways to be an agent pane: the agent said so, wmux
   // identified the process, or the screen carries an agent's chrome. Any one is
@@ -212,8 +238,9 @@ function rosterEntryFor(
    *
    * `unknown` rather than `idle` when nobody spoke: idle is a claim.
    */
-  const state: AgentPresenceState = declaredState ?? detectedState ?? 'unknown';
-  const stateSource = resolveStateSource(declaredState, detectedState);
+  const refined = isCurrentQuestion(declared, detection) ? 'question' : declaredState;
+  const state: AgentPresenceState = refined ?? screenOnlyState(detectedState) ?? 'unknown';
+  const stateSource = refined !== declaredState ? 'detected' : resolveStateSource(declaredState, detectedState);
   const blocked = state === 'blocked';
   const choices = blocked ? (declared?.choices ?? []) : [];
   // A stamped blockedSince is truthful; updatedAt is the best guess when main
@@ -225,7 +252,7 @@ function rosterEntryFor(
     surfaceId: surface.surfaceId,
     paneId: surface.paneId,
     workspaceId: workspace.id,
-    workspaceTitle: workspace.title,
+    workspaceTitle,
     // The agent's own name beats a folder name: with three panes in one repo,
     // "myproj / myproj / myproj" identifies nothing, "claude / codex / claude"
     // is the distinction the user is looking at the list to make. A hand-set tab
@@ -268,13 +295,123 @@ function liveMetadata(
  * than either being wrong, and "declared beats detected" is a rule that must
  * exist once. Returns null when no layer claims the surface.
  */
+/**
+ * A visible, CURRENT question refines a declared `idle`, and nothing else.
+ *
+ * The agent's hooks say "my turn ended", which is true and says nothing about
+ * the question its last message closed on. It never overrides `working` or
+ * `blocked`: those are claims about the present, and a repainted screen must
+ * not outvote them (see the precedence note in rosterEntryFor).
+ *
+ * "Current" is checked, not assumed. The stored verdict is only what the
+ * screen said the last time it was read, so it must have been read during this
+ * idle period (same turn) and for the session main has on record now (same
+ * session). Evidence that cannot be placed in either is never promoted: the
+ * surface then reads as plain `idle`, which is what the agent itself declared.
+ */
+export function isCurrentQuestion(
+  declared: DeclaredAgentSnapshot | undefined,
+  detection: DetectionSnapshot | undefined,
+): boolean {
+  if (!declared || declared.state !== 'idle' || detection?.state !== 'question') return false;
+  // Same turn: the screen was read after this idle period began. A verdict
+  // stored earlier describes a previous turn — and a declared agent used not to
+  // be rescanned at all, so "earlier" could mean hours.
+  const { idleSince } = declared;
+  const { observedAt } = detection;
+  if (typeof idleSince !== 'number' || !Number.isFinite(idleSince)) return false;
+  if (typeof observedAt !== 'number' || !Number.isFinite(observedAt)) return false;
+  if (observedAt < idleSince) return false;
+  // Same session: a surface can outlive the agent session that asked.
+  return (declared.sessionId ?? null) === (detection.sessionId ?? null) && 'sessionId' in detection;
+}
+
+/**
+ * Does a declared state stop the scan loop from reading this surface?
+ *
+ * Working and blocked do: the agent is reporting, and a result that is never
+ * produced cannot leak into a merge. Idle does not, because an idle agent is
+ * exactly where an unanswered question sits — the hooks say "my turn ended"
+ * and nothing about what the last message asked.
+ */
+export function detectionPausedBy(declaredState: string | undefined): boolean {
+  return declaredState === 'working' || declaredState === 'blocked';
+}
+
+/**
+ * Carry `idleSince` across one declared-state delta.
+ *
+ * Stamped with the renderer's clock on the transition into idle and kept for
+ * as long as the surface stays idle in the same session; dropped the moment it
+ * is anything else. A new session restarts it even from idle to idle (a resume
+ * reports no turn), or a question it asks would sit under the old stamp and
+ * never be republished. Main's snapshot always carries `sessionId`, so a
+ * metadata-only report cannot restart it by omission.
+ * The renderer's clock on purpose: it is compared against `observedAt`, which
+ * the same renderer stamps, so no cross-process skew enters the comparison.
+ */
+export function withIdleSince<T extends DeclaredAgentSnapshot>(
+  previous: DeclaredAgentSnapshot | undefined,
+  next: T,
+  now: number,
+): T {
+  if (next.state !== 'idle') return { ...next, idleSince: undefined };
+  const samePeriod = previous?.state === 'idle' && (previous.sessionId ?? null) === (next.sessionId ?? null);
+  const kept = samePeriod ? previous.idleSince : undefined;
+  return { ...next, idleSince: kept ?? now };
+}
+
+/** The fields of a stored or fresh verdict that decide whether to publish it. */
+interface PublishableDetection {
+  agent: string | null;
+  state: string;
+  ruleId: string | null;
+  observedAt?: number;
+}
+
+/**
+ * Should the scan loop publish `next` over the verdict it last published?
+ *
+ * Unchanged verdicts are not published — the loop ticks several times a second
+ * (#141). A question is the one exception, because its stamp is what makes it
+ * current: a stamp older than the surface's current idle period must be
+ * renewed, or the same question asked again next turn would never be shown.
+ *
+ * Evidence is deliberately not compared. The question rule's evidence includes
+ * the prompt line, which carries the answer as the user types it, so comparing
+ * it republished on every keystroke. Nothing reads the stored evidence, and a
+ * second question in the same idle period is current under the first stamp.
+ */
+export function detectionNeedsPublish(
+  previous: PublishableDetection | null | undefined,
+  next: PublishableDetection,
+  idleSince: number | undefined,
+): boolean {
+  if (!previous) return true;
+  if (previous.state !== next.state || previous.agent !== next.agent || previous.ruleId !== next.ruleId) return true;
+  if (next.state !== 'question') return false;
+  return typeof idleSince === 'number' && (previous.observedAt ?? -Infinity) < idleSince;
+}
+
 export function surfaceAgentState(
   declared: DeclaredAgentSnapshot | undefined,
   detection: DetectionSnapshot | undefined,
 ): { state: AgentPresenceState; source: 'declared' | 'detected' } | null {
+  if (isCurrentQuestion(declared, detection)) return { state: 'question', source: 'detected' };
   if (declared && declared.state !== 'unknown') return { state: declared.state, source: 'declared' };
-  if (detection && detection.state !== 'unknown') return { state: detection.state, source: 'detected' };
-  return null;
+  const seen = screenOnlyState(detection && detection.state !== 'unknown' ? detection.state : null);
+  return seen ? { state: seen, source: 'detected' } : null;
+}
+
+/**
+ * What a screen verdict stands for when no agent declared anything.
+ *
+ * `question` only ever refines a declared idle (isCurrentQuestion): without one
+ * there is no turn and no session to place it in. What such a screen does show
+ * is a finished turn at an open prompt, which is idle.
+ */
+function screenOnlyState(detected: AgentPresenceState | null): AgentPresenceState | null {
+  return detected === 'question' ? 'idle' : detected;
 }
 
 /** Which layer supplied `state`. Declared always wins — see the note above. */
@@ -287,6 +424,8 @@ function resolveStateSource(
   return null;
 }
 
+const NO_WORKSPACE_LABELS: ReadonlyMap<WorkspaceId, string> = new Map();
+
 /**
  * Fold declared agent state over the live workspace list.
  *
@@ -295,6 +434,12 @@ function resolveStateSource(
  * records only through a 256-entry LRU, so the renderer's map accumulates
  * entries for surfaces that were closed minutes ago. Iterating the map would
  * make "2 need you" survive closing both panes.
+ *
+ * @param workspaceLabels What each workspace is called, by id
+ *   (`useWorkspaceLabels`, or `selectWorkspaceLabels` outside React). Every
+ *   caller that SHOWS `workspaceTitle` passes it, so the roster names a
+ *   workspace the way the sidebar does (#343); a workspace it does not list, or
+ *   a caller that only counts, gets the stored title.
  */
 export function rollupAgents(
   workspaces: WorkspaceInfo[],
@@ -302,6 +447,7 @@ export function rollupAgents(
   now: number,
   identities: Record<string, AgentIdentitySnapshot | undefined> = {},
   detections: Record<string, DetectionSnapshot | undefined> = {},
+  workspaceLabels: ReadonlyMap<WorkspaceId, string> = NO_WORKSPACE_LABELS,
 ): AgentRollup {
   const byWorkspace: Record<string, AgentCounts> = {};
   const totals = EMPTY_COUNTS();
@@ -313,11 +459,13 @@ export function rollupAgents(
 
     const surfaces: SurfaceEntry[] = [];
     collectSurfaces(workspace.splitTree, surfaces);
+    const workspaceTitle = workspaceLabels.get(workspace.id) ?? workspace.title;
 
     for (const surface of surfaces) {
       const entry = rosterEntryFor(
         surface,
         workspace,
+        workspaceTitle,
         agentStates[surface.surfaceId],
         identities[surface.surfaceId],
         detections[surface.surfaceId],
@@ -341,6 +489,32 @@ export function rollupAgents(
 }
 
 /**
+ * The roster ranked by who is waiting on the user.
+ *
+ * Permission prompts first, longest-waiting first; then questions; then
+ * everything else — each of the last two in tree order. A question has no dwell
+ * to rank by (nothing declared when it was asked), so tree order is the honest
+ * one. Same chain as `workspaceAgentState`, so the list and the sidebar cannot
+ * disagree about which agent comes first.
+ */
+export function rankedRoster(rollup: AgentRollup): AgentRosterEntry[] {
+  const questions = rollup.roster.filter((e) => e.state === 'question');
+  const rest = rollup.roster.filter((e) => e.state !== 'blocked' && e.state !== 'question');
+  return [...rollup.blocked, ...questions, ...rest];
+}
+
+/**
+ * The one agent a "go to who needs me" button should land on: the permission
+ * prompt waiting longest, else the first question in tree order, else none.
+ * Read off the same ranking, so the button cannot pick a different agent from
+ * the one the list puts first.
+ */
+export function firstWaiting(rollup: AgentRollup): AgentRosterEntry | undefined {
+  const first = rankedRoster(rollup)[0];
+  return first && (first.state === 'blocked' || first.state === 'question') ? first : undefined;
+}
+
+/**
  * The single state a workspace row should read as.
  *
  * Blocked outranks working for the same reason it does in workspace-status.ts:
@@ -351,6 +525,8 @@ export function rollupAgents(
 export function workspaceAgentState(counts: AgentCounts | undefined): AgentPresenceState | null {
   if (!counts || counts.total === 0) return null;
   if (counts.blocked > 0) return 'blocked';
+  // Waiting on the user, so ahead of work that proceeds on its own.
+  if (counts.question > 0) return 'question';
   if (counts.working > 0) return 'working';
   // `idle` outranks `unknown` because it is a claim someone actually made; a
   // workspace of nothing but silent agents must not borrow it.

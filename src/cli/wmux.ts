@@ -25,6 +25,7 @@ import {
   opencodePluginSourceDir,
   removeOpencodeTui,
 } from './opencode-tui-install';
+import { retryTransient, type Patience } from './transport-retry';
 
 /** The two signals wsl-network.ts uses to decide we are inside a WSL distro. */
 function readWslEnvironment(): WslEnvironment {
@@ -60,10 +61,19 @@ function readWslNetworkingMode(): string | null {
 }
 
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
-// so the CLI talks to the same instance that spawned the shell.
-const PIPE_PATH = process.env.WMUX_PIPE || (process.platform === 'win32'
-  ? '\\\\.\\pipe\\wmux'
-  : `${process.env.XDG_RUNTIME_DIR || require('os').tmpdir()}/wmux${process.env.WMUX_INSTANCE?.trim() ? '-' + process.env.WMUX_INSTANCE.trim() : ''}.sock`);
+// so the CLI talks to the same instance that spawned the shell. Without it, the
+// fallback follows WMUX_INSTANCE the way shared/instance.ts's getPipePath()
+// does — restated rather than imported, because the CLI ships file by file (see
+// wmux-hook.ts). It used to be the installed pipe whatever the instance, while
+// readPipeToken() below already read that instance's token: a CLI run outside a
+// pane against a side-by-side build sent the dev token to the installed wmux.
+export function cliPipePath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): string {
+  if (env.WMUX_PIPE) return env.WMUX_PIPE;
+  const instance = env.WMUX_INSTANCE?.trim() ?? '';
+  if (platform === 'win32') return '\\\\.\\pipe\\wmux' + (instance ? '-' + instance : '');
+  return `${env.XDG_RUNTIME_DIR || require('os').tmpdir()}/wmux${instance ? '-' + instance : ''}.sock`;
+}
+const PIPE_PATH = cliPipePath(process.env);
 
 // ─── Remote transport (issue #78: remote wmux management) ────────────────────
 // When --remote host[:port] (or WMUX_REMOTE) is set, every command connects
@@ -190,7 +200,14 @@ function connectViaNpiperelay(pipePath: string, onConnect: () => void): Duplex {
   }
   // npiperelay names the pipe with forward slashes: \\.\pipe\wmux → //./pipe/wmux
   const child = spawn(bin, ['-ei', '-s', pipePath.replace(/\\/g, '/')], {
-    stdio: ['pipe', 'pipe', 'inherit'],
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let relayError = '';
+  child.stderr?.on('data', (chunk: Buffer) => {
+    // npiperelay writes "open //./pipe/wmux: All pipe instances are busy" here
+    // and exits non-zero. Keep it on the error so the caller can tell a busy
+    // pipe (safe to retry for an idempotent request) from a missing one.
+    if (relayError.length < 2_000) relayError += chunk.toString();
   });
   const duplex = new Duplex({
     read() {},
@@ -218,7 +235,10 @@ function connectViaNpiperelay(pipePath: string, onConnect: () => void): Duplex {
   child.stdout?.on('end', () => duplex.push(null));
   child.on('error', (err: Error) => duplex.destroy(err));
   child.on('exit', (code: number | null) => {
-    if (code !== 0 && code !== null) duplex.destroy(new Error(`npiperelay exited with code ${code}`));
+    if (code !== 0 && code !== null) {
+      const detail = relayError.trim().slice(0, 500);
+      duplex.destroy(new Error(detail ? `npiperelay exited with code ${code}: ${detail}` : `npiperelay exited with code ${code}`));
+    }
   });
   // "Ready" here means the relay process exists — NOT that it has attached to the
   // named pipe, which over WSL interop can take seconds longer. onConnect must
@@ -344,6 +364,35 @@ function sendV2(
   });
 }
 
+/**
+ * A busy pipe clears in about a second during a restore; this budget keeps a
+ * report from waiting longer than the agent would notice.
+ */
+const REPORT_PATIENCE: Patience = { budgetMs: 4_000, firstAttemptMs: 1_500 };
+/** Prompt admission is a log entry, not a turn: don't delay the agent for long. */
+const PROMPT_PATIENCE: Patience = { budgetMs: 1_500, firstAttemptMs: 750 };
+
+/**
+ * `sendV2` for requests that may be asked twice.
+ *
+ * Only reports/releases/prompt admission use this. The request is idempotent at
+ * main's boundary, so a duplicate after a lost reply is harmless; a spawn or a
+ * typed key must never take this path. A successful reply resolves the retry
+ * loop immediately — the next attempt only exists when the previous one never
+ * produced a response.
+ */
+function sendV2Patiently(
+  method: string,
+  params: Record<string, any> = {},
+  patience: Patience = REPORT_PATIENCE,
+  timeoutMs: number = DEFAULT_V2_TIMEOUT_MS,
+): Promise<any> {
+  return retryTransient(
+    (attemptMs) => sendV2(method, params, Math.max(1, Math.min(timeoutMs, attemptMs))),
+    patience,
+  );
+}
+
 // Simple flag helpers shared across commands.
 function getFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -465,6 +514,26 @@ export function browserRequest(args: string[], caller?: string): BrowserRequest 
   if (!build) return null;
   const req = build(args);
   return caller ? { ...req, params: { ...req.params, caller } } : req;
+}
+
+/** How long `wmux open` waits for the renderer to accept the URL. */
+export const OPEN_URL_TIMEOUT_MS = 10_000;
+
+/**
+ * The single positional argument of `wmux open`: one http(s) URL.
+ *
+ * Validated in the CLI as well as the renderer because a typo should fail with
+ * a usage-shaped message before a request reaches the pipe. `new URL` also
+ * rejects a bare host, so `wmux open example.com` is an error rather than a
+ * silently mangled request.
+ */
+export function openUrlArg(args: string[]): string {
+  const value = args[1] ?? '';
+  const protocol = URL.canParse(value) ? new URL(value).protocol : '';
+  if (args.length > 2 || (protocol !== 'http:' && protocol !== 'https:')) {
+    throw new Error('wmux open: expected one http(s) URL');
+  }
+  return value;
 }
 
 /**
@@ -844,7 +913,7 @@ function printManifestResult(result: any): void {
 async function cmdWorkspace(args: string[]): Promise<void> {
   const sub = args[1];
   if (sub === 'list') {
-    print(await sendV2('workspace.list', {}));
+    print(await sendV2('workspace.list_manifests', {}));
     return;
   }
   if (sub === 'save') return workspaceSave(args.slice(2));
@@ -944,21 +1013,43 @@ async function cmdMarkdown(args: string[]): Promise<void> {
  * by whatever the user later puts in config.toml, which is the better contract
  * for a script anyway.
  */
+const NEW_WORKSPACE_FLAGS: Record<string, string> = {
+  '--title': 'title',
+  '--shell': 'shell',
+  '--cwd': 'cwd',
+  '--panes': 'panes',
+  '--layout': 'layout',
+  '--worktree': 'worktree',
+  '--base': 'base',
+};
+
 async function cmdNewWorkspace(args: string[]): Promise<void> {
   const params: any = {};
   for (let i = 1; i < args.length; i += 2) {
-    if (args[i] === '--title') params.title = args[i + 1];
-    if (args[i] === '--shell') params.shell = args[i + 1];
-    if (args[i] === '--cwd') params.cwd = args[i + 1];
-    if (args[i] === '--panes') params.panes = parseInt(args[i + 1], 10);
-    if (args[i] === '--layout') params.layout = args[i + 1];
+    const key = NEW_WORKSPACE_FLAGS[args[i]];
+    if (key) params[key] = key === 'panes' ? parseInt(args[i + 1], 10) : args[i + 1];
   }
   // A non-numeric --panes must not travel as NaN: it serialises to `null` in
   // JSON and arrives looking like a deliberate value.
   if (params.panes !== undefined && !Number.isFinite(params.panes)) {
     fail('new-workspace', COMMAND_SPECS['new-workspace'], '--panes takes a number from 1 to 8');
   }
+  if (params.worktree !== undefined) Object.assign(params, worktreeRepoDir(params.cwd));
   print(await sendV2('workspace.create', params));
+}
+
+/**
+ * Which repository `--worktree` branches from: the CALLER's, never the
+ * focused workspace's (#246). An explicit `--cwd` resolves against this
+ * shell's directory; inside a pane main reads the caller surface's reported
+ * cwd (sendV2 attaches `caller`); outside one, this process's cwd is the
+ * caller's. Over `--remote` a local path means nothing on the other machine,
+ * so it is passed through untouched.
+ */
+function worktreeRepoDir(cwd: unknown): { cwd?: string } {
+  if (remoteTarget) return typeof cwd === 'string' ? { cwd } : {};
+  if (typeof cwd === 'string' && cwd) return { cwd: path.resolve(process.cwd(), cwd) };
+  return process.env.WMUX_SURFACE_ID ? {} : { cwd: process.cwd() };
 }
 
 /**
@@ -1212,16 +1303,27 @@ async function cmdSend(args: string[]): Promise<void> {
   print(await sendV2('surface.send_text', payload));
 }
 
+const KEY_MODIFIER_FLAGS = ['--ctrl', '--shift', '--alt'] as const;
+
+/**
+ * `send-key` params. The key is the first argument that is neither a modifier
+ * flag nor `--surface` and its value, so flags may come before or after it, as
+ * `send` already allows. It used to be `args[1]`, which made
+ * `send-key --surface X enter` send the key "--surface".
+ */
+export function sendKeyParams(
+  args: string[],
+  callerSurface?: string,
+): { key: string | undefined; modifiers: string[]; surfaceId?: string } {
+  const flags = new Set<string>(KEY_MODIFIER_FLAGS);
+  const key = stripFlag(args.slice(1), '--surface').find((a) => !flags.has(a));
+  const modifiers = KEY_MODIFIER_FLAGS.filter((f) => args.includes(f)).map((f) => f.slice(2));
+  const surfaceId = getFlag(args, '--surface') || callerSurface;
+  return surfaceId ? { key, modifiers, surfaceId } : { key, modifiers };
+}
+
 async function cmdSendKey(args: string[]): Promise<void> {
-  const key = args[1];
-  const modifiers: string[] = [];
-  if (args.includes('--ctrl')) modifiers.push('ctrl');
-  if (args.includes('--shift')) modifiers.push('shift');
-  if (args.includes('--alt')) modifiers.push('alt');
-  const surfaceId = getFlag(args, '--surface') || process.env.WMUX_SURFACE_ID;
-  const payload: Record<string, any> = { key, modifiers };
-  if (surfaceId) payload.surfaceId = surfaceId;
-  print(await sendV2('surface.send_key', payload));
+  print(await sendV2('surface.send_key', sendKeyParams(args, process.env.WMUX_SURFACE_ID)));
 }
 
 /** One prompt line: `#<seq>  <hh:mm>  <summary>`. */
@@ -1290,6 +1392,25 @@ function printAllPrompts(result: any): void {
     for (const entry of surfaces[id]) console.log(`  ${promptLine(entry)}`);
   }
   printPromptTruncation(result, true);
+}
+
+/**
+ * `wmux read-screen` argv → `surface.read_text` params. Same targeting rule as
+ * send/send-key: inside a pane the caller's own surface is the default;
+ * cross-pane reads take --surface explicitly. `--events` is opt-in because
+ * agents call read-screen constantly and only a diagnosis wants the history.
+ */
+export function readScreenParams(
+  args: string[],
+  callerSurface: string | undefined,
+): { surfaceId?: string; lines: number; events?: true } {
+  const lines = getFlag(args, '--lines');
+  const surfaceId = getFlag(args, '--surface') || callerSurface;
+  return {
+    ...(surfaceId ? { surfaceId } : {}),
+    lines: lines ? parseInt(lines) : 50,
+    ...(args.includes('--events') ? { events: true as const } : {}),
+  };
 }
 
 /**
@@ -1365,7 +1486,7 @@ export function hookParams(args: string[]): Record<string, string> {
 }
 
 async function cmdHook(args: string[]): Promise<void> {
-  await sendV2('hook.event', hookParams(args));
+  await sendV2Patiently('hook.event', hookParams(args), PROMPT_PATIENCE);
 }
 
 /**
@@ -1860,7 +1981,7 @@ async function cmdReportAgent(args: string[]): Promise<void> {
     }
   }
 
-  print(await sendV2('pane.report_agent', params));
+  print(await sendV2Patiently('pane.report_agent', params));
 }
 
 /**
@@ -1889,7 +2010,7 @@ async function cmdReportMetadata(args: string[]): Promise<void> {
   const tokens = getFlag(args, '--tokens'); if (tokens) params.tokens = tokens;
   const pct = getFlag(args, '--context-pct'); if (pct) params.contextPct = Number(pct);
   const ttl = getFlag(args, '--ttl'); if (ttl) params.ttlMs = Number(ttl);
-  print(await sendV2('pane.report_metadata', params));
+  print(await sendV2Patiently('pane.report_metadata', params));
 }
 
 /**
@@ -1911,7 +2032,7 @@ async function cmdReportSubagent(args: string[]): Promise<void> {
   const name = getFlag(args, '--name'); if (name !== undefined) params.name = name;
   const detail = getFlag(args, '--detail'); if (detail !== undefined) params.detail = detail;
   params.done = args.includes('--done');
-  print(await sendV2('agent.subagent', params));
+  print(await sendV2Patiently('agent.subagent', params));
 }
 
 // Keys stay inferred (no Record<string, …> annotation) so spreading this into
@@ -1922,7 +2043,7 @@ const AGENT_STATE_COMMANDS = {
   'report-subagent': cmdReportSubagent,
   'report-session': async (args: string[]) => {
     const surfaceId = reportingSurface(args, 'report-session');
-    print(await sendV2(getFlag(args, '--provider') === 'codex' ? 'pane.report_codex_session' : 'pane.report_agent_session', {
+    print(await sendV2Patiently(getFlag(args, '--provider') === 'codex' ? 'pane.report_codex_session' : 'pane.report_agent_session', {
       surfaceId,
       seq: seqFlag(args),
       sessionId: getFlag(args, '--session') ?? args[1] ?? null,
@@ -1935,14 +2056,25 @@ const AGENT_STATE_COMMANDS = {
     // OpenCode's plugin releases only the session it reported (#290): main
     // refuses it while quitting, and when the pane already holds a newer one.
     if (getFlag(args, '--provider') === 'opencode') {
-      print(await sendV2('pane.release_opencode_session', { surfaceId, sessionId: getFlag(args, '--session') ?? null }));
+      print(await sendV2Patiently('pane.release_opencode_session', { surfaceId, sessionId: getFlag(args, '--session') ?? null }));
       return;
     }
     if (getFlag(args, '--provider') === 'omp') {
-      print(await sendV2('pane.release_omp_session', { surfaceId, sessionId: getFlag(args, '--session') ?? null }));
+      print(await sendV2Patiently('pane.release_omp_session', { surfaceId, sessionId: getFlag(args, '--session') ?? null }));
       return;
     }
-    print(await sendV2('pane.release_agent', { surfaceId, seq: seqFlag(args) }));
+    // pi's extension (#382): main releases only on a quit, only the file the
+    // shutdown names, and drops a release older than the pane's last report.
+    if (getFlag(args, '--provider') === 'pi') {
+      print(await sendV2Patiently('pane.release_pi_session', {
+        surfaceId,
+        sessionId: getFlag(args, '--session') ?? null,
+        reason: getFlag(args, '--reason') ?? null,
+        seq: seqFlag(args),
+      }));
+      return;
+    }
+    print(await sendV2Patiently('pane.release_agent', { surfaceId, seq: seqFlag(args) }));
   },
   // No --surface → the whole picture, including a `blocked` list that answers
   // "which pane needs me?" in one call.
@@ -2010,7 +2142,7 @@ interface CommandSpec {
 
 const SURFACE_NOTE = '(surface defaults to $WMUX_SURFACE_ID inside a pane)';
 
-const COMMAND_SPECS = {
+export const COMMAND_SPECS = {
   // System
   ping: { usage: 'wmux ping' },
   identify: { usage: 'wmux identify' },
@@ -2018,6 +2150,11 @@ const COMMAND_SPECS = {
   'list-windows': { usage: 'wmux list-windows' },
   'focus-window': { usage: 'wmux focus-window <windowId>' },
   'new-window': { usage: 'wmux new-window' },
+
+  // Links
+  open: {
+    usage: 'wmux open <http(s) URL>   (open in the wmux browser panel, per Settings → Browser → Links)',
+  },
 
   // Remote management (issue #78)
   bridge: {
@@ -2039,7 +2176,8 @@ const COMMAND_SPECS = {
     usage: 'wmux workspace open [path] [--dry-run] [--new] [--json]   (bring up a wmux.workspace.json; asks before running anything)\n'
       + 'wmux workspace validate [path] [--json]\n'
       + 'wmux workspace save [--to <dir|file.json>] [--name N] [--workspace <id>] [--force] [--stdout]\n'
-      + 'wmux workspace list',
+      + 'wmux workspace list   (manifests you allowed to run on this machine; empty until you open one and choose to run it.\n'
+      + '                       Your open workspaces are `wmux list-workspaces`)',
     value: ['--to', '--name', '--workspace'],
     bool: ['--dry-run', '--new', '--json', '--force', '--stdout'],
     passthrough: true,
@@ -2047,10 +2185,13 @@ const COMMAND_SPECS = {
 
   // Workspace
   'new-workspace': {
-    usage: 'wmux new-workspace [--title T] [--shell S] [--cwd D] [--panes N] [--layout L]\n'
-      + '  --panes  1-8 terminal panes (default: the [workspace] setting, 3)\n'
-      + '  --layout grid | columns | rows | left | down | single',
-    value: ['--title', '--shell', '--cwd', '--panes', '--layout'],
+    usage: 'wmux new-workspace [--title T] [--shell S] [--cwd D] [--panes N] [--layout L] [--worktree B] [--base R]\n'
+      + '  --panes     1-8 terminal panes (default: the [workspace] setting, 3)\n'
+      + '  --layout    grid | columns | rows | left | down | single\n'
+      + '  --worktree  New branch, checked out in a dedicated Git worktree workspace\n'
+      + '              (repository: --cwd, else the calling pane\'s folder)\n'
+      + '  --base      Base branch or commit for the worktree (default: HEAD)',
+    value: ['--title', '--shell', '--cwd', '--panes', '--layout', '--worktree', '--base'],
   },
   ssh: { usage: 'wmux ssh [ssh options] <user@host> [--title T]', passthrough: true },
   'close-workspace': { usage: 'wmux close-workspace [workspaceId]' },
@@ -2062,7 +2203,7 @@ const COMMAND_SPECS = {
 
   // Surface
   'new-surface': {
-    usage: 'wmux new-surface [--type terminal|browser|markdown|prompts] [--color-scheme NAME]',
+    usage: 'wmux new-surface [--type terminal|browser|markdown|prompts|git] [--color-scheme NAME]',
     value: ['--type', '--color-scheme'],
   },
   'close-surface': { usage: 'wmux close-surface [surfaceId]' },
@@ -2087,7 +2228,7 @@ const COMMAND_SPECS = {
 
   // Pane
   split: {
-    usage: 'wmux split [--down] [--type terminal|browser|markdown|prompts] [--color-scheme NAME]',
+    usage: 'wmux split [--down] [--type terminal|browser|markdown|prompts|git] [--color-scheme NAME]',
     value: ['--type', '--color-scheme'],
     bool: ['--down'],
   },
@@ -2120,8 +2261,13 @@ const COMMAND_SPECS = {
     bool: ['--ctrl', '--shift', '--alt'],
   },
   'read-screen': {
-    usage: `wmux read-screen [--lines N] [--surface <id>]   ${SURFACE_NOTE}`,
+    usage: [
+      `wmux read-screen [--lines N] [--surface <id>] [--events]   ${SURFACE_NOTE}`,
+      '  Text of the active buffer, plus which buffer it is, its size and the cursor.',
+      '  --events adds the pane\'s recent buffer switches and resizes, oldest first.',
+    ].join('\n'),
     value: ['--lines', '--surface'],
+    bool: ['--events'],
   },
   prompts: {
     usage: [
@@ -2237,7 +2383,7 @@ const COMMAND_SPECS = {
     bool: ['--done'],
   },
   'report-session': {
-    usage: `wmux report-session <sessionId> [--provider claude|codex|opencode|agy|qwen|omp] [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
+    usage: `wmux report-session <sessionId> [--provider claude|codex|opencode|agy|qwen|omp|pi] [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
     value: ['--session', '--provider', '--seq', '--surface'],
   },
   'answer-agent': {
@@ -2245,8 +2391,8 @@ const COMMAND_SPECS = {
     value: ['--surface', '--choice'],
   },
   'release-agent': {
-    usage: `wmux release-agent [--seq N] [--surface <id>] | --provider opencode|omp --session <id>   ${SURFACE_NOTE}`,
-    value: ['--seq', '--surface', '--provider', '--session'],
+    usage: `wmux release-agent [--seq N] [--surface <id>] | --provider opencode|omp --session <id> | --provider pi [--session <file>] [--reason <r>] [--seq N]   ${SURFACE_NOTE}`,
+    value: ['--seq', '--surface', '--provider', '--session', '--reason'],
   },
   'agent-state': {
     usage: 'wmux agent-state [--surface <id>]   (no --surface → every pane, the blocked list, and every identified agent)',
@@ -2327,6 +2473,9 @@ const COMMANDS: Record<CommandName, (args: string[]) => Promise<void> | void> = 
   'focus-window': async (args) => print(await sendV2('window.focus', { id: args[1] })),
   'new-window': async () => print(await sendV2('window.create')),
 
+  // Links
+  open: async (args) => print(await sendV2('link.open', { url: openUrlArg(args) }, OPEN_URL_TIMEOUT_MS)),
+
   // Remote management (issue #78)
   bridge: cmdBridge,
   token: cmdToken,
@@ -2405,14 +2554,7 @@ const COMMANDS: Record<CommandName, (args: string[]) => Promise<void> | void> = 
   send: cmdSend,
   'send-key': cmdSendKey,
   'read-screen': async (args) => {
-    const lines = args.find((a, i) => args[i - 1] === '--lines');
-    // Same targeting rule as send/send-key: inside a pane the caller's own
-    // surface is the default; cross-pane reads take --surface explicitly.
-    const surfaceId = getFlag(args, '--surface') || process.env.WMUX_SURFACE_ID;
-    print(await sendV2('surface.read_text', {
-      ...(surfaceId ? { surfaceId } : {}),
-      lines: lines ? parseInt(lines) : 50,
-    }));
+    print(await sendV2('surface.read_text', readScreenParams(args, process.env.WMUX_SURFACE_ID)));
   },
   prompts: cmdPrompts,
   'trigger-flash': async (args) => print(await sendV2('surface.trigger_flash', { id: args[1] })),
@@ -2522,6 +2664,7 @@ function printUsage() {
 Usage: wmux <command> [options]
 
 System:     ping, identify, capabilities, list-windows, focus-window <id>, new-window
+Links:      open <url>   (open it in the wmux browser panel, per Settings → Browser → Links)
 Workspace:  new-workspace, close-workspace, select-workspace, rename-workspace, list-workspaces
             current-workspace | whoami [--surface <id>]   (the workspace THIS pane is in)
 Remote:     ssh [ssh options] <user@host> [--title T]   (remote terminal in a new workspace)
@@ -2537,7 +2680,7 @@ Pane:       split [--down] [--type T] [--color-scheme NAME], close-pane, focus-p
             pane new|close|focus|list   (verb form, mirrors issue #4 example)
 Layout:     layout grid --count <N> [--type terminal] [--anchor-surface <id>]
             layout agents --count <N> [--coordinator-ratio R] [--anchor-surface <id>]
-Terminal:   send <text>, send-key <key>, read-screen [--lines N] [--surface <id>], trigger-flash
+Terminal:   send <text>, send-key <key>, read-screen [--lines N] [--surface <id>] [--events], trigger-flash
             prompts [--surface <id>] [--limit N] [--json]
             (the prompts this pane was given — the one thing read-screen cannot
              recover, since an agent TUI repaints over its own scrollback)

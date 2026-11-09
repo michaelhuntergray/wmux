@@ -11,6 +11,7 @@
  *   cursor-blink    = true
  *   scrollback-lines = 10000
  *   osc-title-tabs  = true        # label a tab with the program's window title (#221)
+ *   osc-title-workspaces = true   # same for a workspace wmux named by default
  *
  *   [terminal.colors]
  *   default = "Dracula"
@@ -27,11 +28,19 @@
  *
  *   [appearance]
  *   ui-theme = "light"   # light | dark | system (issue #67)
+ *   inactive-pane-dim = 0   # % black over unfocused panes, 0-60; 0 = off; ignored in Focus mode
+ *
+ *   [sidebar]
+ *   wrap-titles = true         # let a long workspace title wrap to two lines (issue #342)
  *
  *   [workspace]                # what a NEW workspace starts as (issue #212)
  *   panes  = 3                 # 1-8 terminal panes
  *   layout = "grid"            # grid | columns | rows | left | down | single
  *   snapshot-minutes = 5       # snapshot the layout this often; 0 = never
+ *
+ *   [workspace.keep-awake]     # keep Windows awake (issue #363); pushed to main at boot
+ *   mode = "smart"             # smart (while an agent reports working) | always | off
+ *   prevent-display-sleep = false   # also keep the screen on
  *
  *   [browser]
  *   dev-ports = [8501, 4321]   # extra dev-server ports, merged with built-in defaults
@@ -41,6 +50,9 @@
  *   [remote]
  *   upload-on-paste = true     # scp a pasted image to the host an ssh pane is on
  *   upload-on-drop  = true     # same for a dropped file; hold Shift to invert per-drop
+ *
+ *   [paste]
+ *   downscale-images = true    # shrink a pasted image to what Claude Code keeps (issue #381)
  *
  *   [keys]                     # remap what a key sends to the terminal (issue #146)
  *   "ctrl+k"     = "<C-k><Delete>"
@@ -56,6 +68,7 @@ import * as path from 'path';
 import { parseToml, TomlTable, TomlValue } from './toml-parser';
 import { parseKeyRemaps, KeyRemap } from '../shared/key-sequence';
 import { WorkspaceLayout } from '../shared/types';
+import { MAX_INACTIVE_PANE_DIM_PCT } from '../shared/inactive-pane-dim';
 
 export interface UserColorScheme {
   background?: string;
@@ -79,6 +92,8 @@ export interface UserConfig {
     scrollbackLines?: number;
     /** Label a tab with the program's OSC 0/2 window title (issue #221). */
     oscTitleTabs?: boolean;
+    /** Name a default-named workspace after that window title too. */
+    oscTitleWorkspaces?: boolean;
     /** Reports per cell of a touch pan forwarded to a mouse-tracking app (issue #267). */
     touchPanGain?: number;
     userColorSchemes?: Record<string, UserColorScheme>;
@@ -86,6 +101,13 @@ export interface UserConfig {
   /** App UI theme (issue #67) — separate from the terminal color scheme. */
   appearance?: {
     uiTheme?: UiTheme;
+    /** 0–60 (%) black over unfocused panes; 0 = no dimming. */
+    inactivePaneDim?: number;
+  };
+  /** Sidebar display options that Settings → Sidebar also offers. */
+  sidebar?: {
+    /** Let a long workspace title wrap to two lines before truncating (issue #342). */
+    wrapTitles?: boolean;
   };
   /**
    * What a new workspace starts as (issue #212). Ranked below a saved default
@@ -102,6 +124,10 @@ export interface UserConfig {
      * in minutes; `0` switches it off (issue #238).
      */
     snapshotMinutes?: number;
+    keepAwake?: {
+      mode?: 'smart' | 'always' | 'off';
+      preventDisplaySleep?: boolean;
+    };
   };
   /** Browser surface behavior — dev-server port detection & auto-navigation. */
   browser?: {
@@ -123,6 +149,14 @@ export interface UserConfig {
   remote?: {
     uploadOnPaste?: boolean;
     uploadOnDrop?: boolean;
+  };
+  /**
+   * Clipboard paste (issue #381). `downscaleImages` defaults to true: a pasted
+   * image is shrunk to the largest size Claude Code would keep before it is
+   * written. False keeps every pixel.
+   */
+  paste?: {
+    downscaleImages?: boolean;
   };
   /**
    * User key remaps (issue #146) — chord → bytes the terminal should send.
@@ -343,6 +377,9 @@ function mapTerminalSection(root: TomlTable, errors: string[]): NonNullable<User
   const oscTitleTabs = asBool(terminal['osc-title-tabs'] ?? terminal.oscTitleTabs);
   if (oscTitleTabs !== undefined) t.oscTitleTabs = oscTitleTabs;
 
+  const oscTitleWorkspaces = asBool(terminal['osc-title-workspaces'] ?? terminal.oscTitleWorkspaces);
+  if (oscTitleWorkspaces !== undefined) t.oscTitleWorkspaces = oscTitleWorkspaces;
+
   const touchPanGain = asNumber(terminal['touch-pan-gain'] ?? terminal.touchPanGain);
   if (touchPanGain !== undefined) {
     if (touchPanGain > 0) t.touchPanGain = touchPanGain;
@@ -356,18 +393,46 @@ function mapTerminalSection(root: TomlTable, errors: string[]): NonNullable<User
 }
 
 // App UI theme (issue #67): `[appearance] ui-theme = "light" | "dark" | "system"`.
+// Unfocused-pane dimming: `[appearance] inactive-pane-dim = 0..60` (percent, so 20 = 20%; 0.2 is rejected).
 function mapAppearanceSection(root: TomlTable, errors: string[]): NonNullable<UserConfig['appearance']> | undefined {
   const appearance = asTable(root.appearance);
   if (!appearance) return undefined;
+  const a: NonNullable<UserConfig['appearance']> = {};
 
   const uiThemeRaw = asString(appearance['ui-theme'] ?? appearance.uiTheme);
-  if (!uiThemeRaw) return undefined;
-
   if (uiThemeRaw === 'light' || uiThemeRaw === 'dark' || uiThemeRaw === 'system') {
-    return { uiTheme: uiThemeRaw };
+    a.uiTheme = uiThemeRaw;
+  } else if (uiThemeRaw) {
+    errors.push(`appearance.ui-theme: "${uiThemeRaw}" not one of light|dark|system`);
   }
-  errors.push(`appearance.ui-theme: "${uiThemeRaw}" not one of light|dark|system`);
-  return undefined;
+
+  const dim = asNumber(appearance['inactive-pane-dim'] ?? appearance.inactivePaneDim);
+  if (dim !== undefined) {
+    // 0 < dim < 1 is almost certainly the 0..1 form the issue floated: taken as a
+    // percent it is effectively "off", so say so instead of silently accepting it.
+    if (dim > 0 && dim < 1) {
+      const pct = Math.round(dim * 100);
+      const hint = pct > 0 && pct <= MAX_INACTIVE_PANE_DIM_PCT ? `; for ${pct}% write ${pct}` : '';
+      errors.push(`appearance.inactive-pane-dim: ${dim} is a percent (0-${MAX_INACTIVE_PANE_DIM_PCT})${hint}`);
+    } else if (dim >= 0 && dim <= MAX_INACTIVE_PANE_DIM_PCT) a.inactivePaneDim = dim;
+    else errors.push(`appearance.inactive-pane-dim: ${dim} not between 0 and ${MAX_INACTIVE_PANE_DIM_PCT}`);
+  }
+
+  return Object.keys(a).length ? a : undefined;
+}
+
+// `[sidebar] wrap-titles = true | false` (issue #342).
+function mapSidebarSection(root: TomlTable, errors: string[]): NonNullable<UserConfig['sidebar']> | undefined {
+  const sidebar = asTable(root.sidebar);
+  if (!sidebar) return undefined;
+  const out: NonNullable<UserConfig['sidebar']> = {};
+
+  const wrapTitlesRaw = sidebar['wrap-titles'] ?? sidebar.wrapTitles;
+  const wrapTitles = asBool(wrapTitlesRaw);
+  if (wrapTitles !== undefined) out.wrapTitles = wrapTitles;
+  else if (wrapTitlesRaw !== undefined) errors.push('sidebar.wrap-titles: expected boolean');
+
+  return Object.keys(out).length ? out : undefined;
 }
 
 /**
@@ -436,6 +501,40 @@ function mapWorkspaceSection(root: TomlTable, errors: string[]): NonNullable<Use
       }
       out.snapshotMinutes = clamped;
     }
+  }
+
+  const keepAwake = mapKeepAwake(workspace, errors);
+  if (keepAwake) out.keepAwake = keepAwake;
+
+  return Object.keys(out).length ? out : undefined;
+}
+
+type KeepAwakeConfig = NonNullable<NonNullable<UserConfig['workspace']>['keepAwake']>;
+const KEEP_AWAKE_MODES: readonly NonNullable<KeepAwakeConfig['mode']>[] = ['smart', 'always', 'off'];
+
+/** `[workspace.keep-awake]` (issue #363) — the only spelling read. */
+function mapKeepAwake(workspace: TomlTable, errors: string[]): KeepAwakeConfig | undefined {
+  const table = asTable(workspace['keep-awake']);
+  if (!table) return undefined;
+  const out: KeepAwakeConfig = {};
+
+  const modeRaw = table.mode;
+  if (modeRaw !== undefined) {
+    const mode = asString(modeRaw);
+    if (mode === undefined) {
+      errors.push('workspace.keep-awake.mode: expected a string');
+    } else if ((KEEP_AWAKE_MODES as readonly string[]).includes(mode)) {
+      out.mode = mode as KeepAwakeConfig['mode'];
+    } else {
+      errors.push(`workspace.keep-awake.mode: "${mode}" not one of ${KEEP_AWAKE_MODES.join('|')}`);
+    }
+  }
+
+  const preventRaw = table['prevent-display-sleep'] ?? table.preventDisplaySleep;
+  if (preventRaw !== undefined) {
+    const prevent = asBool(preventRaw);
+    if (prevent === undefined) errors.push('workspace.keep-awake.prevent-display-sleep: expected a boolean');
+    else out.preventDisplaySleep = prevent;
   }
 
   return Object.keys(out).length ? out : undefined;
@@ -526,6 +625,24 @@ function mapRemoteSection(root: TomlTable, errors: string[]): NonNullable<UserCo
 }
 
 /**
+ * Clipboard paste: `[paste] downscale-images = bool` (issue #381).
+ *
+ * The opt-out for the downscale: the size Claude Code resizes to is the
+ * default because that is what reads most pasted screenshots, but a pane may
+ * hold something else that wants the full resolution.
+ */
+function mapPasteSection(root: TomlTable, errors: string[]): NonNullable<UserConfig['paste']> | undefined {
+  const paste = asTable(root.paste);
+  if (!paste) return undefined;
+
+  const raw = paste['downscale-images'] ?? paste.downscaleImages;
+  const downscale = asBool(raw);
+  if (downscale !== undefined) return { downscaleImages: downscale };
+  if (raw !== undefined) errors.push('paste.downscale-images: expected boolean');
+  return undefined;
+}
+
+/**
  * Key remaps: `[keys] "ctrl+k" = "<C-k><Delete>"` (issue #146).
  *
  * Parsing happens here rather than in the renderer so the errors land in the
@@ -549,6 +666,9 @@ function mapToConfig(root: TomlTable, errors: string[]): UserConfig {
   const appearance = mapAppearanceSection(root, errors);
   if (appearance) out.appearance = appearance;
 
+  const sidebar = mapSidebarSection(root, errors);
+  if (sidebar) out.sidebar = sidebar;
+
   const workspace = mapWorkspaceSection(root, errors);
   if (workspace) out.workspace = workspace;
 
@@ -557,6 +677,9 @@ function mapToConfig(root: TomlTable, errors: string[]): UserConfig {
 
   const remote = mapRemoteSection(root, errors);
   if (remote) out.remote = remote;
+
+  const paste = mapPasteSection(root, errors);
+  if (paste) out.paste = paste;
 
   const keys = mapKeysSection(root, errors);
   if (keys) out.keys = keys;

@@ -7,7 +7,7 @@
 //
 // No version marker here: the marker on tui.js is what the installer compares,
 // and the pair is always written together (core first, entry last).
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,7 +18,7 @@ import * as path from "node:path";
  * value ends up on a restored pane's command line, and the two halves are
  * installed separately so neither can import the other.
  */
-export const SESSION_ID_RE = /^ses_[A-Za-z0-9]{8,120}$/;
+export const SESSION_ID_RE = /^ses_[A-Za-z0-9_]{8,120}$/;
 
 /** Basenames that can execute a .js file we hand them. */
 const JS_RUNTIME_RE = /^(node|bun)(\.exe)?$/i;
@@ -130,6 +130,9 @@ export function makeLogger(file) {
   };
 }
 
+/** How long one CLI call may run before execFile kills it and reports done. */
+const CLI_TIMEOUT_MS = 10_000;
+
 /**
  * Run the wmux CLI without ever blocking or throwing into OpenCode.
  *
@@ -137,10 +140,22 @@ export function makeLogger(file) {
  * shell is involved unless the PATH fallback names `wmux`, which on Windows is
  * why the .cmd shim is refused (#154/#187).
  */
-export function callWmux(runtime, argv, log = () => {}, env = process.env, platform = process.platform) {
+export function callWmux(runtime, argv, log = () => {}, env = process.env, platform = process.platform, done = () => {}) {
+  // `done` fires exactly once, on every path, when this call can no longer
+  // reach the pipe — which is what lets a reporter order its own calls. The
+  // argument is null on success, and the failure otherwise, so a caller that
+  // must not lose a report can retry exactly the calls that never landed.
+  let finished = false;
+  const finish = (failure = null) => {
+    if (finished) return;
+    finished = true;
+    try { done(failure); } catch {}
+  };
   try {
     const cli = env.WMUX_CLI;
-    const opts = { windowsHide: true };
+    // Bounded: the activity reporter keeps one call in flight and waits on
+    // `done`, so a CLI that never returned would silence every later report.
+    const opts = { windowsHide: true, timeout: CLI_TIMEOUT_MS };
     let file;
     let args;
     if (cli) {
@@ -153,6 +168,7 @@ export function callWmux(runtime, argv, log = () => {}, env = process.env, platf
       // The PATH shim is `wmux.cmd`, which execFile cannot spawn without a
       // shell. Nothing to do — WMUX_CLI is always set alongside WMUX=1.
       log("cli: skipped (no WMUX_CLI on win32)", argv);
+      finish();
       return;
     } else {
       file = "wmux";
@@ -165,9 +181,45 @@ export function callWmux(runtime, argv, log = () => {}, env = process.env, platf
       } else {
         log(`cli: ${argv[0]} ok`);
       }
+      finish(err ?? null);
     });
   } catch (err) {
     log("cli: threw", (err && err.message) || String(err));
+    finish(err ?? new Error("wmux CLI threw"));
+  }
+}
+
+/**
+ * Synchronous sibling of `callWmux`, for the process-exit hook.
+ *
+ * An async spawn dies with the process, so a handle released from `exit` must
+ * be sent synchronously. Bounded like the async path: quitting OpenCode is not
+ * worth hanging on, and a failed release is better than a stuck process. The
+ * server half uses the same shape.
+ */
+export function callWmuxSync(runtime, argv, log = () => {}, env = process.env, platform = process.platform) {
+  try {
+    const cli = env.WMUX_CLI;
+    let file;
+    let args;
+    let childEnv = env;
+    if (cli) {
+      file = runtime.file;
+      args = [cli, ...argv];
+      if (runtime.electron) childEnv = { ...env, ELECTRON_RUN_AS_NODE: "1" };
+    } else if (platform === "win32") {
+      log("cli: sync skipped (no WMUX_CLI on win32)", argv);
+      return false;
+    } else {
+      file = "wmux";
+      args = argv;
+    }
+    log("cli: sync", args);
+    execFileSync(file, args, { windowsHide: true, timeout: 1500, stdio: "ignore", env: childEnv });
+    return true;
+  } catch (err) {
+    log("cli: sync failed", (err && err.message) || String(err));
+    return false;
   }
 }
 
@@ -191,34 +243,249 @@ export function planSessionReport(route, rootOf) {
 }
 
 /**
- * Reports the viewed session to wmux, once per session, and releases the last
- * handle on dispose.
+ * Reports the viewed session to wmux, once per session. `releaseOnExit` is the
+ * synchronous release for `process.once("exit")`; `dispose` remains the async
+ * form for a caller that is still alive.
  *
  * `last` is intentionally sticky across navigation to a non-session route:
  * the pane's conversation is still the last one it was in, and restore should
  * reopen it. `disposed` is sticky too — a disposed TUI must not resurrect a
  * handle when a late store update fires.
+ *
+ * A report that never reached main must not leave `last` permanently set: the
+ * pane would look reported while the sidebar held no handle, and every later
+ * `observe` of the same id would be deduped away. Failed calls therefore retry
+ * on a bounded schedule, and `reassert` repeats a handle that main may have
+ * dropped (a late PTY clear, or an exit release racing the next OpenCode in
+ * the same tab) when the pane starts its next turn.
  */
-export function createSessionReporter({ surface, callWmux: send, log = () => {} }) {
+const SESSION_REPORT_RETRY_MS = [1000, 3000, 10000];
+
+export function createSessionReporter({
+  surface,
+  callWmux: send,
+  callWmuxSync: sendSync,
+  log = () => {},
+  schedule = (fn, ms) => setTimeout(fn, ms),
+  cancel = (timer) => clearTimeout(timer),
+  reassertAfterMs = 30_000,
+}) {
   let last = null;
+  let confirmed = false;
   let disposed = false;
+  let retryTimer = null;
+  let retryStep = 0;
+  let lastSentAt = 0;
+  // Only the newest report call may settle state: a late failure from an older
+  // call must not undo a confirmation, nor start a second retry chain.
+  let sendSeq = 0;
+  let inFlight = false;
+
+  const clearRetry = () => {
+    if (retryTimer === null) return;
+    try { cancel(retryTimer); } catch {}
+    retryTimer = null;
+  };
+
+  const scheduleRetry = (id) => {
+    if (disposed || last !== id || retryTimer !== null) return;
+    const delay = SESSION_REPORT_RETRY_MS[retryStep];
+    if (delay === undefined) {
+      log("session: gave up", id);
+      return;
+    }
+    retryStep += 1;
+    try {
+      retryTimer = schedule(() => {
+        retryTimer = null;
+        if (disposed || last !== id) return;
+        sendReport(id);
+      }, delay);
+      // A pending retry must not keep a quitting TUI alive.
+      if (retryTimer && typeof retryTimer.unref === "function") retryTimer.unref();
+    } catch (err) {
+      log("session: retry failed", (err && err.message) || String(err));
+    }
+  };
+
+  const sendReport = (id) => {
+    lastSentAt = Date.now();
+    const seq = ++sendSeq;
+    inFlight = true;
+    let answered = false;
+    const done = (failure) => {
+      if (answered) return;
+      answered = true;
+      if (seq !== sendSeq) return;
+      inFlight = false;
+      if (disposed || last !== id) return;
+      if (failure) {
+        confirmed = false;
+        log("session: report failed", (failure && failure.message) || String(failure));
+        scheduleRetry(id);
+        return;
+      }
+      confirmed = true;
+      retryStep = 0;
+      clearRetry();
+    };
+    try {
+      send(["report-session", id, "--provider", "opencode", "--surface", surface], done);
+    } catch (err) {
+      done(err ?? new Error("report-session threw"));
+    }
+  };
+
+  /**
+   * Release the last handle. `sync` is for the process-exit hook: an async
+   * spawn dies with the process, so only the synchronous CLI can land there.
+   * The host's plugin DISPOSE is deliberately NOT treated as an exit — it also
+   * runs on a reload after `wmux opencode-tui` writes new files, and releasing
+   * there made every open pane lose its restore handle.
+   */
+  const release = (sync) => {
+    if (disposed) return false;
+    disposed = true;
+    clearRetry();
+    if (!last) return false;
+    const id = last;
+    last = null;
+    const argv = ["release-agent", "--provider", "opencode", "--session", id, "--surface", surface];
+    if (sync && typeof sendSync === "function") sendSync(argv);
+    else send(argv);
+    return true;
+  };
+
   return {
     observe(route, rootOf) {
-      if (disposed) return;
+      if (disposed) return false;
       const id = planSessionReport(route, rootOf);
-      if (!id || id === last) return;
+      if (!id || id === last) return false;
       last = id;
+      confirmed = false;
+      retryStep = 0;
+      clearRetry();
       log("session", id);
-      send(["report-session", id, "--provider", "opencode", "--surface", surface]);
+      sendReport(id);
+      return true;
     },
-    dispose() {
-      if (disposed) return;
-      disposed = true;
-      if (!last) return;
-      const id = last;
+    /**
+     * Repeat the held handle when this pane starts a turn.
+     *
+     * `id` is the event's session (its root); a background session must not
+     * overwrite the viewed one, so a mismatch is ignored. Once a report is
+     * confirmed the repeat is throttled — this is reconciliation, not a poll.
+     */
+    reassert(id) {
+      if (disposed || !last) return false;
+      if (typeof id === "string" && id && id !== last) return false;
+      // A report still in flight, or a retry already scheduled, will settle
+      // the handle on its own; a second concurrent call only races it.
+      if (inFlight || retryTimer !== null) return false;
+      if (confirmed && Date.now() - lastSentAt < reassertAfterMs) return false;
+      retryStep = 0;
+      clearRetry();
+      log("session: reassert", last);
+      sendReport(last);
+      return true;
+    },
+    /**
+     * Drop a handle the agent deleted. A deleted session must never become a
+     * restore command: OpenCode would open an empty home screen and the saved
+     * id would stay in the tree forever. Only the handle this reporter holds
+     * is released, matching the server half's `session.deleted` rule.
+     */
+    forget(id) {
+      if (disposed || typeof id !== "string" || !id || id !== last) return false;
       last = null;
+      confirmed = false;
+      clearRetry();
+      log("session deleted", id);
       send(["release-agent", "--provider", "opencode", "--session", id, "--surface", surface]);
+      return true;
     },
+    /** Whether a handle is currently held, so a seeder can stop retrying. */
+    hasSession() {
+      return last !== null;
+    },
+    /** Asynchronous release, for a caller that is still alive. */
+    dispose() {
+      release(false);
+    },
+    /** Synchronous release, for `process.once("exit")`. */
+    releaseOnExit() {
+      return release(true);
+    },
+  };
+}
+
+/**
+ * Reports a session that becomes current while the TUI is still starting.
+ *
+ * The Solid effect in the entry file is the ordinary trigger, and a session
+ * opened after startup reaches it reliably. The gap is the session the TUI
+ * restores or auto-opens during its own startup: the effect's first read can
+ * happen before the route exists, and a route assigned afterwards is not
+ * guaranteed to re-run it. A bounded re-read is the backstop — it is not a
+ * poll for the life of the TUI, and it stops the moment a handle is reported.
+ *
+ * `reportCurrent` is injected so the schedule and the read are both testable
+ * without an OpenCode host. It must return true when a handle was sent.
+ */
+export function createSessionSeeder({
+  reportCurrent,
+  log = () => {},
+  schedule = (fn, ms) => setTimeout(fn, ms),
+  cancel = (timer) => clearTimeout(timer),
+  delays = [250, 1000, 2000, 4000],
+}) {
+  let stopped = false;
+  let timer = null;
+  let next = 0;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== null) {
+      try { cancel(timer); } catch {}
+      timer = null;
+    }
+  };
+
+  const attempt = () => {
+    timer = null;
+    if (stopped) return;
+    let reported = false;
+    try {
+      reported = reportCurrent() === true;
+    } catch (err) {
+      log("seed: threw", (err && err.message) || String(err));
+    }
+    if (reported) {
+      stop();
+      return;
+    }
+    const delay = delays[next++];
+    if (delay === undefined) {
+      log("seed: gave up");
+      return;
+    }
+    try {
+      timer = schedule(attempt, delay);
+    } catch (err) {
+      log("seed: schedule failed", (err && err.message) || String(err));
+      return;
+    }
+    // A pending seed must not keep a quitting TUI alive.
+    if (timer && typeof timer.unref === "function") timer.unref();
+  };
+
+  return {
+    /** Read once now, then on the declared schedule until a report succeeds. */
+    start() {
+      if (!stopped) attempt();
+    },
+    stop,
   };
 }
 
@@ -274,6 +541,22 @@ export function tabSessionIds(list) {
 }
 
 /**
+ * The route to report: the router's session when it has one, else the only
+ * session open in this TUI.
+ *
+ * A `--server` TUI that auto-opens the last conversation can show it while
+ * `ui.router.current()` still answers home/null; the tab list knows the
+ * session even when the route does not. Only a SINGLE tab is used: with
+ * several, guessing which one is displayed would file the wrong conversation
+ * as the pane's restore handle.
+ */
+export function routeFromTabs(route, tabs) {
+  if (route && route.type === "session" && typeof route.sessionID === "string") return route;
+  const ids = tabSessionIds(tabs);
+  return ids.length === 1 ? { type: "session", sessionID: ids[0] } : route;
+}
+
+/**
  * Reports hosted user prompts through the same `hook.event` path the server
  * half uses (#305): `caller` is stamped by the CLI transport, and the renderer
  * resolves it for the prompt log only. `inboxID` dedupes admission; the
@@ -308,7 +591,16 @@ const MAX_ANSWERED = 200;
 /** Where a blocked-state event keeps its session id: forms nest it in `form`. */
 export function eventSessionID(type, data) {
   if (!data || typeof data !== "object") return null;
-  const id = type === "form.created" ? data.form && data.form.sessionID : data.sessionID;
+  let id;
+  if (type === "form.created") {
+    id = data.form && data.form.sessionID;
+  } else if (type === "session.deleted") {
+    // v2 is flat (`data.sessionID`); the server half also accepts `info.id`.
+    const info = data.info && typeof data.info === "object" ? data.info : null;
+    id = data.sessionID || (info && info.id);
+  } else {
+    id = data.sessionID;
+  }
   return typeof id === "string" && id ? id : null;
 }
 
@@ -410,6 +702,80 @@ export function createBlockedReporter({ surface, callWmux: send, log = () => {} 
           return;
         default:
           return;
+      }
+    },
+  };
+}
+
+/**
+ * Declares whether this pane is working (#310 phase 3b).
+ *
+ * v2 opens a busy period with `session.execution.started` and ends it with
+ * exactly one of succeeded/failed/interrupted — the same pair the bundled TUI
+ * notifications plugin uses. Depth is ABSOLUTE (`--run-depth 0|1`): the same
+ * value means the same thing to every producer, so a second reporter converges
+ * instead of inflating a refcount.
+ *
+ * Running sessions are tracked by id, for the reason 01df550 fixed in the
+ * blocked reporter: the pane owns what it reported. An end clears its id even
+ * when the view has moved — hosting only gates the start — and a subagent's end
+ * cannot return the pane to idle while its parent is still running.
+ *
+ * Reports go out ONE AT A TIME. Each is its own CLI process, and two processes
+ * spawned a few ms apart race to the pipe: a short turn's `--run-depth 0` could
+ * land before its `1` and leave the pane "working" for the whole trust window —
+ * the #151 race. The next report waits for the previous call to finish, and
+ * whatever changed meanwhile collapses into the latest wanted depth.
+ */
+export function createActivityReporter({ surface, callWmux: send, log = () => {} }) {
+  const running = new Set();
+  let wanted = null;
+  let sent = null;
+  let inFlight = false;
+
+  const flush = () => {
+    if (inFlight || wanted === sent) return;
+    const depth = wanted;
+    sent = depth;
+    inFlight = true;
+    log(depth ? "working" : "idle");
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      inFlight = false;
+      flush();
+    };
+    try {
+      send(["report-agent", "--surface", surface, "--run-depth", depth ? "1" : "0"], finish);
+    } catch {
+      finish();
+    }
+  };
+
+  const report = (depth) => {
+    wanted = depth;
+    flush();
+  };
+
+  return {
+    observe(type, data, hosted) {
+      if (!data || typeof data !== "object") return;
+      const sessionID = typeof data.sessionID === "string" ? data.sessionID : "";
+      if (!sessionID) return;
+      if (type === "session.execution.started") {
+        if (!hosted || running.has(sessionID)) return;
+        running.add(sessionID);
+        report(true);
+        return;
+      }
+      if (
+        type === "session.execution.succeeded" ||
+        type === "session.execution.failed" ||
+        type === "session.execution.interrupted"
+      ) {
+        if (!running.delete(sessionID)) return;
+        if (running.size === 0) report(false);
       }
     },
   };

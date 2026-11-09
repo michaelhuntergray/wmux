@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import { en } from '../../src/renderer/i18n/locales/en';
+import { fr } from '../../src/renderer/i18n/locales/fr';
 
 import { mergedAgentSignals, resolveStatusText, stateDotClassFor, statusClassFor, StatusTextInputs } from '../../src/renderer/components/Sidebar/workspace-status';
 import { agentsForWorkspace } from '../../src/renderer/store/agent-view';
@@ -14,7 +18,6 @@ function inputs(over: Partial<StatusTextInputs> = {}): StatusTextInputs {
     workingSessions: 0,
     blockedSessions: 0,
     currentToolLabel: null,
-    claudeIsIdle: false,
     ...over,
   };
 }
@@ -27,7 +30,7 @@ describe('resolveStatusText — declared work outranks the shell', () => {
   //
   // `workingSessions` used to be consulted ONLY inside the `sessionCount >= 2`
   // branch, so a single session fell past it, past the null tool label, past
-  // claudeIsIdle (false — it early-returns unless the shell says "running"),
+  // the idle claim (none here),
   // and landed on the shell's own state. A shell reporting idle (the Claude
   // Code TUI is not a "running command") then rendered the row "Idle" while the
   // agent worked — the authoritative signal computed, then dropped.
@@ -75,7 +78,7 @@ describe('resolveStatusText — active subagents exclude completed history', () 
       agents.forEach((agent, i) => { agent.done = i < finished; });
       const view = agentsForWorkspace(tree, activity, new Map(), now);
       expect(resolveStatusText(inputs({
-        runningAgentCount: view.running, claudeIsIdle: true,
+        runningAgentCount: view.running, agentCounts: counts({ idle: 1 }),
       }), t)).toBe(expected);
     }
     expect(agentsForWorkspace(tree, activity, new Map(), now).total).toBe(5);
@@ -107,8 +110,8 @@ describe('resolveStatusText — established precedence is unchanged', () => {
       .toBe('Idle');
   });
 
-  it('claudeIsIdle stops a busy shell from reading as Running', () => {
-    const s = inputs({ sessionCount: 1, workingSessions: 0, claudeIsIdle: true, shellState: 'running' });
+  it('an idle claim stops a busy shell from reading as Running', () => {
+    const s = inputs({ sessionCount: 1, workingSessions: 0, agentCounts: counts({ idle: 1 }), shellState: 'running' });
     expect(resolveStatusText(s, t)).toBe('Idle');
   });
 
@@ -149,7 +152,7 @@ describe('statusClassFor — the colour must not contradict the words', () => {
   });
 
   it('an idle session with a busy shell stays idle, not running', () => {
-    const s = inputs({ sessionCount: 1, workingSessions: 0, claudeIsIdle: true, shellState: 'running' });
+    const s = inputs({ sessionCount: 1, workingSessions: 0, agentCounts: counts({ idle: 1 }), shellState: 'running' });
     expect(statusClassFor(s)).toBe('workspace-row__status--idle');
     expect(resolveStatusText(s, t)).toBe('Idle');
   });
@@ -163,9 +166,9 @@ describe('statusClassFor — the colour must not contradict the words', () => {
 });
 
 /** A roster slice. Absent kinds are 0, exactly as rollupAgents reports them. */
-function counts(over: Partial<{ blocked: number; working: number; idle: number; unknown: number }> = {}) {
-  const c = { blocked: 0, working: 0, idle: 0, unknown: 0, ...over };
-  return { ...c, total: c.blocked + c.working + c.idle + c.unknown };
+function counts(over: Partial<{ blocked: number; question: number; working: number; idle: number; unknown: number }> = {}) {
+  const c = { blocked: 0, question: 0, working: 0, idle: 0, unknown: 0, ...over };
+  return { ...c, total: c.blocked + c.question + c.working + c.idle + c.unknown };
 }
 
 describe('mergedAgentSignals — the roster joins the older signals (issue #235)', () => {
@@ -224,14 +227,62 @@ describe('mergedAgentSignals — the roster joins the older signals (issue #235)
     expect(mergedAgentSignals(s)).toEqual({ blocked: 3, working: 2, idle: false });
   });
 
-  it('an idle claim from either source reads as idle', () => {
+  it('only a roster idle claim reads as idle', () => {
     expect(mergedAgentSignals(inputs({ agentCounts: counts({ idle: 1 }) })).idle).toBe(true);
-    expect(mergedAgentSignals(inputs({ claudeIsIdle: true })).idle).toBe(true);
+    expect(mergedAgentSignals(inputs()).idle).toBe(false);
     expect(mergedAgentSignals(inputs({ agentCounts: counts({ unknown: 2 }) })).idle).toBe(false);
   });
 
   it('no roster at all behaves as it always did', () => {
     expect(mergedAgentSignals(inputs({ blockedSessions: 1, workingSessions: 2 })))
       .toEqual({ blocked: 1, working: 2, idle: false });
+  });
+});
+
+describe('a current question is its own workspace state', () => {
+  const asking = () => inputs({ agentCounts: counts({ question: 1 }), shellState: 'idle' });
+
+  it('reads as a question across the text, the colour class and the dot — not Idle, not Needs you', () => {
+    expect(resolveStatusText(asking(), t)).toBe('Question for you');
+    expect(statusClassFor(asking())).toBe('workspace-row__status--question');
+    expect(stateDotClassFor(asking(), false)).toBe('workspace-row__state-dot--question');
+  });
+
+  it('a permission prompt in the same workspace still outranks it', () => {
+    const s = inputs({ agentCounts: counts({ blocked: 1, question: 1 }) });
+    expect(resolveStatusText(s, t)).toBe('Needs you');
+    expect(statusClassFor(s)).toBe('workspace-row__status--blocked');
+  });
+});
+
+// A class name the chains return and no stylesheet defines is a state the user
+// cannot see: the row renders, in the default colour, exactly like Idle.
+describe('the question state is actually drawn', () => {
+  const css = (name: string) =>
+    fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'renderer', 'styles', name), 'utf8');
+  const asking = () => inputs({ agentCounts: counts({ question: 1 }), shellState: 'idle' });
+
+  it('the sidebar stylesheet defines the status and dot classes the chains return', () => {
+    const sidebar = css('sidebar.css');
+    expect(sidebar).toContain(`.${statusClassFor(asking())} {`);
+    expect(sidebar).toContain(`.${stateDotClassFor(asking(), false)} {`);
+  });
+
+  it('the tab bar marks a tab whose agent is asking a question', () => {
+    expect(css('splitpane.css')).toContain(".surface-tab[data-agent-state='question']::before");
+  });
+
+  it('is its own colour, not the permission prompt\'s and not the working one', () => {
+    const sidebar = css('sidebar.css');
+    const rule = (cls: string) => sidebar.slice(sidebar.indexOf(`.${cls} {`)).split('}')[0];
+    const question = rule('workspace-row__status--question');
+    expect(question).toContain('var(--ui-agent-question');
+    expect(question).not.toContain('--ui-agent-blocked');
+    expect(rule('workspace-row__status--blocked')).not.toContain('--ui-agent-question');
+  });
+
+  it('has a French label', () => {
+    expect(fr['workspaceRow.question']).toBe('Question pour vous');
+    expect(en['workspaceRow.question']).toBe('Question for you');
   });
 });

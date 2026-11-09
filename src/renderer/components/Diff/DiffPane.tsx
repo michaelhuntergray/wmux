@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useT } from '../../i18n';
+import { DIFF_SELECT_EVENT, takeDiffSelection } from './open-diff';
+import { DiffHunks, parseDiff, type DiffHunk } from './diff-render';
 import '../../styles/diff.css';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -10,70 +12,6 @@ interface ChangedFile {
   additions: number;
   deletions: number;
 }
-
-interface DiffLine {
-  type: 'add' | 'remove' | 'context';
-  content: string;
-  oldNum?: number;
-  newNum?: number;
-}
-
-interface DiffHunk {
-  header: string;
-  context: string;
-  lines: DiffLine[];
-}
-
-// ─── Diff parser ────────────────────────────────────────────────────────────
-
-const HEADER_PREFIXES = ['diff --git', 'index ', '---', '+++', 'new file', 'deleted file'];
-// Anchored, with non-optional groups: the loose `,?\d*` form backtracks
-// super-linearly on a crafted `@@` line.
-const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/;
-
-/** Append one body line to `hunk`, advancing the line counters it owns. */
-function pushBodyLine(hunk: DiffHunk, line: string, nums: { old: number; new: number }): void {
-  if (line.startsWith('+')) {
-    hunk.lines.push({ type: 'add', content: line.slice(1), newNum: nums.new++ });
-  } else if (line.startsWith('-')) {
-    hunk.lines.push({ type: 'remove', content: line.slice(1), oldNum: nums.old++ });
-  } else if (line.startsWith(' ') || line === '') {
-    const content = line.startsWith(' ') ? line.slice(1) : '';
-    hunk.lines.push({ type: 'context', content, oldNum: nums.old++, newNum: nums.new++ });
-  }
-}
-
-function parseDiff(raw: string): DiffHunk[] {
-  if (!raw) return [];
-  const hunks: DiffHunk[] = [];
-  let currentHunk: DiffHunk | null = null;
-  const nums = { old: 0, new: 0 };
-
-  for (const line of raw.split('\n')) {
-    if (HEADER_PREFIXES.some(p => line.startsWith(p))) continue;
-
-    if (line.startsWith('@@')) {
-      const match = HUNK_HEADER.exec(line);
-      if (match) {
-        nums.old = parseInt(match[1]);
-        nums.new = parseInt(match[2]);
-        currentHunk = { header: line, context: match[3]?.trim() || '', lines: [] };
-        hunks.push(currentHunk);
-      }
-      continue;
-    }
-
-    if (currentHunk) pushBodyLine(currentHunk, line, nums);
-  }
-
-  return hunks;
-}
-
-const LINE_PREFIX: Record<DiffLine['type'], string> = {
-  add: '+',
-  remove: '-',
-  context: ' ',
-};
 
 // ─── Visibility ─────────────────────────────────────────────────────────────
 
@@ -101,9 +39,10 @@ function isSurfaceVisible(surfaceId: string): boolean {
 interface DiffPaneProps {
   surfaceId: string;
   cwd?: string;
+  baseRef?: string;
 }
 
-export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
+export default function DiffPane({ surfaceId, cwd, baseRef }: DiffPaneProps) {
   const t = useT();
   const [files, setFiles] = useState<ChangedFile[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -136,7 +75,7 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
 
   const loadFiles = useCallback(async () => {
     try {
-      const result = await window.wmux?.diff?.getFiles(cwd || '');
+      const result = await window.wmux?.diff?.getFiles(cwd || '', baseRef);
       if (result?.files) {
         const newFiles = result.files as ChangedFile[];
         const newKey = newFiles.map(f => `${f.path}|${f.status}|${f.additions}|${f.deletions}`).join('\n');
@@ -155,11 +94,11 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
       setLoadingIfChanged(false);
     }
     return [];
-  }, [cwd, setErrorIfChanged, setLoadingIfChanged]);
+  }, [cwd, baseRef, setErrorIfChanged, setLoadingIfChanged]);
 
   const loadDiff = useCallback(async (file: string) => {
     try {
-      const result = await window.wmux?.diff?.getFileDiff(cwd || '', file);
+      const result = await window.wmux?.diff?.getFileDiff(cwd || '', file, baseRef);
       if (result?.diff !== undefined) {
         if (result.diff !== lastDiffRawRef.current) {
           lastDiffRawRef.current = result.diff;
@@ -170,7 +109,7 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
       lastDiffRawRef.current = '';
       setHunks([]);
     }
-  }, [cwd]);
+  }, [cwd, baseRef]);
 
   // The poll reads its loaders through refs rather than closing over them.
   // They are stable today, but this effect must not be restartable by a
@@ -232,6 +171,22 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
     contentRef.current?.scrollTo(0, 0);
   }, [selectedFile]);
 
+  // A file picked in the explorer (#325). It may have been requested before
+  // this tab mounted — the explorer opens the tab and asks in the same click —
+  // so the pending request is read once on mount as well as on the event.
+  useEffect(() => {
+    const take = () => {
+      const file = takeDiffSelection(surfaceId);
+      if (file) setSelectedFile(file);
+    };
+    take();
+    const onSelect = (e: Event) => {
+      if ((e as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId === surfaceId) take();
+    };
+    window.addEventListener(DIFF_SELECT_EVENT, onSelect);
+    return () => window.removeEventListener(DIFF_SELECT_EVENT, onSelect);
+  }, [surfaceId]);
+
   // Listen for immediate updates from Claude Code hooks (faster than polling)
   useEffect(() => {
     if (!window.wmux?.diff?.onUpdate) return;
@@ -261,6 +216,15 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
     await runPass();
     setLoadingIfChanged(false);
   }, [runPass, setLoadingIfChanged]);
+
+  useEffect(() => {
+    const onRefresh = (event: Event) => {
+      const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
+      if (id === surfaceId) void handleRefresh();
+    };
+    document.addEventListener('wmux:refresh-surface', onRefresh);
+    return () => document.removeEventListener('wmux:refresh-surface', onRefresh);
+  }, [handleRefresh, surfaceId]);
 
   // Status badge color
   const statusColor = (status: string) => {
@@ -381,28 +345,7 @@ export default function DiffPane({ surfaceId, cwd }: DiffPaneProps) {
             <div className="diff-pane__file-header">
               <span className="diff-pane__file-header-path">{selectedFile}</span>
             </div>
-            {hunks.map((hunk, hi) => (
-              <div key={hi} className="diff-hunk">
-                <div className="diff-hunk__header">
-                  {hunk.header}
-                  {hunk.context && (
-                    <span className="diff-hunk__context"> {hunk.context}</span>
-                  )}
-                </div>
-                {hunk.lines.map((line, li) => (
-                  <div key={li} className={`diff-line diff-line--${line.type}`}>
-                    <span className="diff-line__gutter diff-line__gutter--old">
-                      {line.type !== 'add' ? line.oldNum : ''}
-                    </span>
-                    <span className="diff-line__gutter diff-line__gutter--new">
-                      {line.type !== 'remove' ? line.newNum : ''}
-                    </span>
-                    <span className="diff-line__prefix">{LINE_PREFIX[line.type]}</span>
-                    <pre className="diff-line__content">{line.content || '\u00A0'}</pre>
-                  </div>
-                ))}
-              </div>
-            ))}
+            <DiffHunks hunks={hunks} />
             <div className="diff-pane__end-spacer" />
           </>
         )}

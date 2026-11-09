@@ -14,6 +14,11 @@ font-size        = 14
 cursor-style     = "block"        # block | underline | bar
 cursor-blink     = true
 scrollback-lines = 10000
+# Name tabs, and workspaces wmux named by default, after the window title their
+# program sets (Claude Code sets the conversation title). A name you chose
+# always wins. Both default to true.
+osc-title-tabs       = true
+osc-title-workspaces = true
 # Touchscreens: scroll steps sent per row of finger travel when a drag scrolls
 # a full-screen app. 1 / the app's own scroll speed makes the content follow
 # the finger (opencode's scroll_speed is 3). Wheel and flick are unaffected.
@@ -52,6 +57,21 @@ palette = [
   "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
 ]
 
+[appearance]
+ui-theme = "dark"        # dark | light | system — the app chrome, not the terminal
+# How much darker unfocused panes are drawn, as a PERCENT from 0 to 60 (default 20),
+# so 20 means 20%, not 0.2 (a value between 0 and 1 is rejected). 0 turns dimming off.
+# While Focus mode (titlebar button) is on, it uses its own fixed 62% dim and this
+# setting has no effect.
+inactive-pane-dim = 20
+
+[sidebar]
+# Let a long workspace title wrap to two lines before it is truncated
+# (Settings -> Sidebar -> "Wrap long workspace titles"). Default false.
+# While this key is set it overrides the Settings toggle at every startup
+# and reload (see "Precedence" below).
+wrap-titles = true
+
 [workspace]
 # What a NEW workspace opens with — the sidebar "+", Ctrl+N, first launch and
 # `wmux new-workspace` all use this.
@@ -59,6 +79,11 @@ panes  = 3         # 1-8 terminal panes
 layout = "grid"    # grid | columns | rows | left | down | single
 # Snapshot the live layout this often, as an "Auto-save …" session. 0 = never.
 snapshot-minutes = 5
+
+[workspace.keep-awake]
+# Keep Windows from sleeping (see "Keep awake" below).
+mode = "smart"                  # smart | always | off
+prevent-display-sleep = false   # also keep the screen on
 
 [browser]
 # Start page for a workspace's browser panel. Needs a scheme.
@@ -71,6 +96,10 @@ auto-open = true
 # In a direct SSH pane, SCP local files before inserting their remote paths.
 upload-on-paste = true
 upload-on-drop  = true
+
+[paste]
+# Shrink a pasted image to the largest size Claude Code keeps (see "Pasted images").
+downscale-images = true
 
 [keys]
 # Remap what a key sends to the terminal (see "Key remaps" below).
@@ -104,6 +133,31 @@ says so. Before 2.8.0 the sidebar `+` always made three panes and
 `wmux new-workspace` always made one — both now follow this setting, and
 `wmux new-workspace --panes 1 --layout single` pins the old CLI shape for a
 script that depends on it.
+
+## Keep awake
+
+`[workspace.keep-awake]` (Settings → Workspace → *Keep computer awake*, or the
+coffee cup in the titlebar) stops Windows from sleeping while wmux has work to
+do (issue #363).
+
+```toml
+[workspace.keep-awake]
+mode = "smart"                  # smart | always | off
+prevent-display-sleep = false
+```
+
+- `smart` (default) holds a sleep blocker only while at least one pane reports
+  itself **working** — Claude Code, Qwen Code and Grok through wmux's hooks, the
+  OpenCode plugin, or anything calling `wmux report-agent`. A pane waiting on
+  you, idle, or with an agent that reports nothing does not keep the machine
+  up, and a `working` claim nobody has renewed for 15 minutes stops counting.
+- `always` holds it for as long as wmux runs; `off` never takes it.
+- `prevent-display-sleep = true` keeps the screen on too; otherwise the display
+  may still turn off and lock while the system stays awake.
+
+The choice is stored by wmux itself and applies from the next launch onward
+whichever window it was made in. When this section is present it is applied at
+every startup and reload, over what was picked in the UI.
 
 ## Session snapshots
 
@@ -196,6 +250,27 @@ process tree. wmux may still identify the outer Windows SSH process, so turn the
 relevant setting off (or hold Shift for a drop) while working on the inner host.
 
 Run `wmux reload-config` after changing either value.
+
+## Pasted images
+
+A pasted image (a screenshot, or anything else copied as an image) is written to
+`%TEMP%\wmux\screenshot-<time>.png` and its path is typed into the pane, or
+uploaded first in an SSH pane (see above).
+
+```toml
+[paste]
+downscale-images = true
+```
+
+By default the image is first shrunk to the largest size, at the same aspect
+ratio, that Claude Code keeps when it sends an image to the model: a long edge of
+at most 2576 px, covering at most 4784 tiles of 28×28 px. Claude Code would
+resize a bigger image anyway, so those pixels only make the paste slower. An
+image that already fits is left untouched. Set `downscale-images = false` to keep
+the full resolution, for example when the file is meant for another program.
+
+The PNG is encoded for speed rather than size (no filtering, fast compression,
+off the UI thread), so it can be larger than one saved by an image editor.
 
 ## Key remaps
 

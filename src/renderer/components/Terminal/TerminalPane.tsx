@@ -5,10 +5,11 @@ import CopyMode from './CopyMode';
 import PinnedPrompt from './PinnedPrompt';
 import PromptOutline from './PromptOutline';
 import NewOutputPill from './NewOutputPill';
+import ResetNotice from './ResetNotice';
 import '../../styles/terminal.css';
 import '../../styles/prompt-marks.css';
 
-interface TerminalPaneProps {
+export interface TerminalPaneProps {
   surfaceId?: string;
   shell?: string;
   cwd?: string;
@@ -30,11 +31,20 @@ interface TerminalPaneProps {
   qwenSessionId?: string;
   /** Omp session to resume on a restored pane. */
   ompSessionId?: string;
+  /** pi session file to resume on a restored pane (#382). */
+  piSessionFile?: string;
   focused?: boolean;
   visible?: boolean;
   showFindBar?: boolean;
   onFindBarClose?: () => void;
   copyModeActive?: boolean;
+  /**
+   * Bumped each time the keep-alive moves this terminal into a new slot (#346),
+   * so it refits, repaints and takes focus back the way it does when shown.
+   */
+  attachGeneration?: number;
+  /** The pane's zoom, applied to the font size (#420). */
+  fontZoom?: number;
 }
 
 export default function TerminalPane({
@@ -50,13 +60,16 @@ export default function TerminalPane({
   agySessionId,
   qwenSessionId,
   ompSessionId,
+  piSessionFile,
   focused = true,
   visible = true,
   showFindBar = false,
   onFindBarClose,
   copyModeActive = false,
+  attachGeneration,
+  fontZoom,
 }: TerminalPaneProps) {
-  const { terminalRef, searchAddonRef, xtermRef } = useTerminal({ surfaceId, shell, cwd, visible, focused, colorScheme, startupCommands, env, claudeSessionId, codexSessionId, opencodeSessionId, agySessionId, qwenSessionId, ompSessionId });
+  const { terminalRef, searchAddonRef, xtermRef } = useTerminal({ surfaceId, shell, cwd, visible, focused, attachGeneration, fontZoom, colorScheme, startupCommands, env, claudeSessionId, codexSessionId, opencodeSessionId, agySessionId, qwenSessionId, ompSessionId, piSessionFile });
 
   const [_lastQuery, setLastQuery] = useState('');
 
@@ -97,6 +110,16 @@ export default function TerminalPane({
     document.addEventListener('wmux:focus-terminal', onFocusTerminal);
     return () => document.removeEventListener('wmux:focus-terminal', onFocusTerminal);
   }, [xtermRef]);
+
+  useEffect(() => {
+    const onRefresh = (event: Event) => {
+      const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
+      if (id !== surfaceId || !activeRef.current) return;
+      try { xtermRef.current?.refresh(0, (xtermRef.current?.rows ?? 1) - 1); } catch { /* disposed */ }
+    };
+    document.addEventListener('wmux:refresh-surface', onRefresh);
+    return () => document.removeEventListener('wmux:refresh-surface', onRefresh);
+  }, [surfaceId, xtermRef]);
 
   const handleSearch = useCallback((query: string) => {
     setLastQuery(query);
@@ -152,6 +175,7 @@ export default function TerminalPane({
         />
       )}
       <CopyMode active={copyModeActive} />
+      {visible && surfaceId && <ResetNotice surfaceId={surfaceId} />}
     </div>
   );
 }

@@ -1,10 +1,12 @@
 import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
-import { registerIpcHandlers, agentManager, ptyManager, setupAgentPtyForwarding, reapOrphanedPtys, sshDetector, agentIdentity, replayRemoteBindings } from './ipc-handlers';
+import { registerIpcHandlers, agentManager, ptyManager, reapOrphanedPtys, sshDetector, agentIdentity, replayRemoteBindings, terminalHistory } from './ipc-handlers';
+import { prepareAgentSpawn } from './agent-spawn-window';
 import { sequenceFrom, splitSequencedReport } from './ssh-detect';
 import { handleDetectionV2 } from './detection-rpc';
 import { isPtyCrashGuardInstalled } from './pty-manager';
 import { logDiagnostic, getDiagnosticsPath } from './crash-diagnostics';
 import { armExitWatchdog } from './exit-watchdog';
+import { isChatGPTDictationContents } from './chatgpt-dictation-host';
 import { planQuit } from './quit-sequence';
 import { handleBrowserV2 } from './v2-browser';
 import { pickBrowserSurface } from './browser-engine-surface';
@@ -24,6 +26,7 @@ import {
   teardownAgentBrowser,
   withDeadline,
 } from './agent-browser-runtime';
+import { verifyRestoredWorktrees } from './git-worktree';
 import { handleBridgeV2 } from './v2-bridge';
 import { distributeAgents, PaneLoadInfo } from './agent-manager';
 import {
@@ -38,11 +41,11 @@ import { PortScanner } from './port-scanner';
 import { CDPProxy } from './cdp-proxy';
 import { IPC_CHANNELS, SurfaceId, BrowserEngine, PaneId, WorkspaceId } from '../shared/types';
 import { getPipePath, getAppDataDir, ensurePipeToken, getAppUserModelId } from '../shared/instance';
+import { isFileEditTool } from '../shared/agent-tools';
 import { resolveUserDataDir } from './chromium-profile';
 import { WORKSPACE_MANIFEST_METHODS, handleWorkspaceManifestV2, pickAndOpenManifest, type ManifestHostDeps } from './workspace-manifest-v2';
 import {
   loadSession,
-  saveSession,
   handleVersionChange,
   savedVersion,
   SessionData,
@@ -51,21 +54,27 @@ import {
   shouldSnapshot,
   writeSessionSnapshot,
 } from './session-persistence';
-import { SessionFlushWaiters } from './session-flush';
+import { randomUUID } from 'crypto';
+import { SessionFlushWaiters, SESSION_FLUSH_TIMEOUT_MS } from './session-flush';
 import { hardenWebviewPreferences } from './webview-prefs';
+import { ignoreMenuShortcutsInGuest } from './webview-menu-shortcuts';
+import { forwardGuestKeys } from './webview-guest-keys';
 import { applyHistoryRestore, claimHistoryRestore, forgetHistoryRestore, parkHistoryRestore } from './browser-history-restore';
 import { stampAgentSessionIds } from './agent-session-persistence';
 import { noteIconRevision } from './icon-cache';
 import { installGpuWatchdog } from './gpu-watchdog';
-import { getAgentState, currentPromptId, currentPromptView, reportAgentSession, isAnsweringInput, noteHumanInput, onAgentStateBroadcast, onAgentSessionChanged, releaseAgyAtPrompt } from './agent-state';
+import { getAgentState, currentPromptId, currentPromptView, reportAgentSession, isAnsweringInput, noteHumanInput, onAgentStateBroadcast, onAgentSessionChanged, releaseAgyAtPrompt, listAgentStates, WORKING_TRUST_MS } from './agent-state';
+import { getAwakeManager, bindAwakeToAgentStates } from './awake-manager';
 import {
   pruneDeadClaudeSessions,
   listKnownTranscriptIds,
 } from './claude-resume';
 import { pruneDeadQwenSessions, listKnownQwenSessionIds } from './qwen-resume';
 import { pruneDeadOmpSessions } from './omp-resume';
+import { pruneDeadPiSessions } from './pi-resume';
 import { sessionWindows, MAX_RESTORED_WINDOWS } from './session-windows';
-import { WindowManager, appIconCandidates } from './window-manager';
+import { WindowManager, appIconCandidates, getAppIcon } from './window-manager';
+import { AppTray } from './app-tray';
 import { initAutoUpdater, requestUpdateNow, getUpdateState } from './updater';
 import { sweepUpdateLeftovers, UPDATE_SWEEP_DELAY_MS } from './zip-updater';
 import { initUpdateChecker, getLatestUpdate } from './update-checker';
@@ -75,7 +84,7 @@ import {
   applyExternalActivity, markSubagentStop, markAllAgentsDone, reportSubagent, endDeclaredSubagents,
 } from './claude-observer';
 import { handleAgentStateV2, setAnswerWriter, deliverAnswer } from './agent-state-rpc';
-import { applyHookToAgentState, hookEventName } from './agent-hook-bridge';
+import { applyHookToAgentState, hookEventName, type HookOrigin } from './agent-hook-bridge';
 import { startOrchestrationWatcher } from './orchestration-watcher';
 import { readMarkdownFile } from './markdown-file';
 import { grantFilePath, clearFileGrants } from './file-grants';
@@ -83,6 +92,7 @@ import { directoryFromArgv } from './shell-context-menu';
 import { ensureAppImageCliLink } from './cli-paths';
 import { reportExplorerCwd } from './explorer-roots';
 import { ensurePowerShellShim } from './powershell-shim';
+import { installPageZoom } from './webcontents-zoom';
 import { loadSettings } from './settings-store';
 import { translateKeyName } from './pty-keys';
 import { initRemoteConsole, getRemoteConsole, handleRemoteConsoleV2 } from './remote-console';
@@ -344,7 +354,8 @@ function routeSpecialV2(
   // release is `pane.release_agent`, sent by its SessionEnd hook as the PTY
   // dies, and gets the same refusal.
   if ((request.method === 'pane.release_codex_session' || request.method === 'pane.release_opencode_session' ||
-       request.method === 'pane.release_omp_session' || request.method === 'pane.release_agent') && isQuitting) {
+       request.method === 'pane.release_omp_session' || request.method === 'pane.release_pi_session' ||
+       request.method === 'pane.release_agent') && isQuitting) {
     respond({ released: false });
     return true;
   }
@@ -427,15 +438,14 @@ function spawnAgentBatch(
   agentParams: any[],
   assignments: string[],
   workspaceId: any,
-  win: BrowserWindow | undefined,
+  spawnAgent: typeof agentManager.spawn,
 ): any[] {
   const results: any[] = [];
   agentParams.forEach((p, i) => {
     try {
       const agentCmd = p.cmd || p.prompt; // accept both 'cmd' and 'prompt'
       if (!agentCmd) { results.push({ error: `Agent ${i}: missing required field 'cmd'` }); return; }
-      const result = agentManager.spawn({ ...p, cmd: agentCmd, paneId: assignments[i] as any, workspaceId });
-      if (win && !win.isDestroyed()) setupAgentPtyForwarding(result.surfaceId, win);
+      const result = spawnAgent({ ...p, cmd: agentCmd, paneId: assignments[i] as any, workspaceId });
       BrowserWindow.getAllWindows().forEach((w) => {
         if (!w.isDestroyed()) {
           w.webContents.send(IPC_CHANNELS.AGENT_UPDATE, {
@@ -458,9 +468,7 @@ const windowManager = new WindowManager();
 // everything for the next launch.
 windowManager.onWindowClosed = (id, webContentsId) => {
   clearFileGrants(webContentsId);
-  if (isQuitting || windowManager.getCount() === 0) return;
-  sessionWindows.forget(id);
-  saveSession({ version: 1, windows: sessionWindows.toArray() });
+  terminalHistory.closeWindow(id, webContentsId, isQuitting, windowManager.getCount());
 };
 
 // Agent exit → renderer. Without this broadcast, sidebar agent lines would
@@ -552,8 +560,10 @@ let quitFlushDone = false;
 /** Ask one window for its state and resolve once it is on disk (or timed out). */
 function flushSessionFrom(win: BrowserWindow): Promise<boolean> {
   if (win.isDestroyed()) return Promise.resolve(false);
-  const saved = sessionFlush.wait(win.webContents.id);
-  win.webContents.send('session:request');
+  const token = randomUUID();
+  const deadline = Date.now() + SESSION_FLUSH_TIMEOUT_MS;
+  const saved = sessionFlush.wait(win.webContents.id, token);
+  win.webContents.send(IPC_CHANNELS.SESSION_REQUEST, { token, deadline });
   return saved;
 }
 
@@ -615,7 +625,7 @@ function scheduleAutoSave(): void {
     autoSaveTimer = null;
     BrowserWindow.getAllWindows().forEach(win => {
       if (!win.isDestroyed()) {
-        win.webContents.send('session:request');
+        win.webContents.send(IPC_CHANNELS.SESSION_REQUEST);
       }
     });
   }, AUTO_SAVE_INTERVAL_MS);
@@ -1034,8 +1044,10 @@ if (!gotInstanceLock) {
   // process's argv — so the folder has to be read from the event, not from our
   // own process.argv, which still holds the original launch.
   app.on('second-instance', (_event, argv) => {
+    // A window hidden to the tray (#442) comes back first; launching wmux
+    // again is how most people would look for it.
     const win = BrowserWindow.getAllWindows()[0];
-    if (win && !win.isDestroyed()) {
+    if (!windowManager.showHiddenWindows() && win && !win.isDestroyed()) {
       if (win.isMinimized()) win.restore();
       win.focus();
     }
@@ -1053,6 +1065,22 @@ if (!gotInstanceLock) {
 function hardenWebContents(): void {
   app.on('web-contents-created', (_event, contents) => {
     const type = contents.getType();
+    const dictation = isChatGPTDictationContents(contents);
+
+    // Guest pages zoom through Electron's zoom-changed. The desktop already
+    // handles its captured DOM gesture through WINDOW_ZOOM: Electron emits
+    // zoom-changed even when that gesture is prevented, so handling both
+    // would apply two zoom steps to the same wheel input.
+    if (type === 'webview') {
+      installPageZoom(contents);
+      // Electron's default menu would otherwise take keys the page leaves
+      // unhandled: Ctrl+W ran Window → Close and quit wmux. See
+      // webview-menu-shortcuts.ts.
+      ignoreMenuShortcutsInGuest(contents);
+      // ...and the desktop's tab-level shortcuts get them instead (Ctrl+W closes
+      // the browser tab). See webview-guest-keys.ts.
+      forwardGuestKeys(contents);
+    }
 
     // Enforce safe webview preferences regardless of attributes set in the DOM,
     // plus Chrome's autoplay rule (#287). The event fires on the HOST — the
@@ -1075,11 +1103,23 @@ function hardenWebContents(): void {
 
     if (type === 'webview') {
       // The browser panel (#281): a sized popup — popup sign-in — opens as a
-      // real window that keeps its opener; every other http(s) request
-      // navigates the panel in place, as the popup bridge has since #126.
+      // real window that keeps its opener; a Ctrl+click or middle-click opens
+      // a new wmux browser tab; every other http(s) request navigates the
+      // panel in place, as the popup bridge has since #126.
       // See webviewWindowOpenPolicy for the measured dispositions.
       contents.setWindowOpenHandler((details) => {
         const decision = webviewWindowOpenPolicy(details);
+        if (decision.kind === 'new-tab') {
+          // The host window owns the tabs, and the pane hosting this guest
+          // adds one. With no host to ask, the link still opens, in place.
+          const host = contents.hostWebContents;
+          if (host && !host.isDestroyed()) {
+            host.send(IPC_CHANNELS.BROWSER_OPEN_IN_NEW_TAB, contents.id, decision.url);
+          } else {
+            contents.loadURL(decision.url).catch(() => {});
+          }
+          return { action: 'deny' };
+        }
         if (decision.kind === 'navigate-in-place') {
           contents.loadURL(decision.url).catch(() => {});
           return { action: 'deny' };
@@ -1115,6 +1155,22 @@ function hardenWebContents(): void {
         contents.once('destroyed', closeChild);
         child.once('closed', () => contents.removeListener('destroyed', closeChild));
       });
+    } else if (dictation) {
+      // Only the dedicated profile, created without a preload, may keep its
+      // authentication chain inside wmux. Desktop windows retain their lock.
+      contents.setWindowOpenHandler(({url}) => /^https:\/\//i.test(url) ? {
+        action:'allow',
+        overrideBrowserWindowOptions:{autoHideMenuBar:true,webPreferences:{session:contents.session,nodeIntegration:false,contextIsolation:true,sandbox:true}},
+      } : {action:'deny'});
+      contents.on('did-create-window', (child) => {
+        child.setMenu(null);
+        const close=()=>{if(!child.isDestroyed())child.destroy();};
+        contents.once('destroyed',close);
+        child.once('closed',()=>contents.removeListener('destroyed',close));
+        child.webContents.on('page-title-updated',(event,title)=>{
+          event.preventDefault();child.setTitle(popupWindowTitle(child.webContents.getURL(),title));
+        });
+      });
     } else {
       // Open new-window requests externally rather than spawning in-app windows
       // with full privileges. Only http/https go to the OS browser; deny the rest.
@@ -1134,7 +1190,7 @@ function hardenWebContents(): void {
     // handles same-frame navigations only; new-window requests never reach it
     // (setWindowOpenHandler above owns those), so a single gesture is launched
     // by one path, never both.
-    if (needsAppWindowNavigationLock(type, !!contents.opener)) {
+    if (needsAppWindowNavigationLock(type, !!contents.opener, dictation)) {
       contents.on('will-navigate', (e, url) => {
         const { preventDefault, openExternal } = willNavigatePolicy(url);
         if (preventDefault) e.preventDefault();
@@ -1257,6 +1313,14 @@ function pushDiffUpdate(file: string): void {
   }
 }
 
+/** The `hook.event` fields that say which thread and which tool call fired it (#399). */
+function hookOrigin(params: any): HookOrigin {
+  return {
+    agentId: typeof params.agentId === 'string' ? params.agentId : null,
+    toolUseId: typeof params.toolUseId === 'string' ? params.toolUseId : null,
+  };
+}
+
 /** One Claude Code hook event, fanned out to every consumer that wants it. */
 function handleHookEvent(params: any): void {
   BrowserWindow.getAllWindows().forEach(w => {
@@ -1280,6 +1344,9 @@ function handleHookEvent(params: any): void {
       Number.isFinite(params.at) ? Number(params.at) : undefined,
       // Tells the idle reminder from a real prompt (issue #253).
       typeof params.notificationType === 'string' ? params.notificationType : null,
+      // Whose tool event this is, so a main-thread call moving past a
+      // permission prompt can retract the block a hook raised (#399).
+      hookOrigin(params),
     );
   }
 
@@ -1308,14 +1375,18 @@ function handleHookEvent(params: any): void {
     reportAgentSession(params.surfaceId as SurfaceId, {
       sessionId: String(params.sessionId),
       provider: params.provider === 'qwen' ? 'qwen' : undefined,
+      // A WSL pane's Claude keeps its transcript in the distro (#428), where the
+      // startup prune cannot look; the mark exempts it from that prune.
+      host: params.host === 'wsl' ? 'wsl' : undefined,
     });
   }
 
   // Always refresh the diff for Edit/Write, even without a file path — but only
   // once the write has happened. PreToolUse carries the same tool name and fires
   // BEFORE it, so refreshing on that would render the diff as it was (issue #151).
+  // Any agent's spelling of an editing tool, not only Claude's (issue #440).
   const isPost = !params?.event || params.event === 'PostToolUse';
-  if (isPost && (params?.tool === 'Edit' || params?.tool === 'Write')) pushDiffUpdate(params.file || '');
+  if (isPost && isFileEditTool(params?.tool)) pushDiffUpdate(params.file || '');
 }
 
 // ─── Claude session restore (issue #186) ─────────────────────────────────────
@@ -1363,6 +1434,28 @@ function pruneRestoredClaudeSessions(windows: SavedWindow[]): void {
     console.log(`[claude-resume] dropped ${dropped} session id(s) with no transcript`);
   }
 }
+/**
+ * Open one window per saved slot, or a single fresh one when there is none.
+ * Each restored window owns its slot and its terminal history, revoked when
+ * its renderer goes away.
+ */
+function openStartupWindows(savedWindows: SavedWindow[]): void {
+  if (savedWindows.length === 0) {
+    sessionWindows.markStartup(windowManager.createWindow());
+    return;
+  }
+  for (const saved of savedWindows) {
+    const id = windowManager.createWindow(saved.bounds, saved.maximized);
+    sessionWindows.prime(id, saved);
+    sessionWindows.markStartup(id);
+    const win = windowManager.getWindow(id);
+    if (!win) continue;
+    const owner = win.webContents.id;
+    terminalHistory.seedWindow(owner);
+    win.webContents.once('destroyed', () => terminalHistory.revokeOwner(owner));
+  }
+}
+
 function pruneRestoredOmpSessions(windows: SavedWindow[]): void {
   if (windows.length === 0) return;
   let dropped = 0;
@@ -1378,6 +1471,23 @@ function pruneRestoredOmpSessions(windows: SavedWindow[]): void {
   }
 }
 
+/**
+ * The same for pi (#382), stricter: `pi --session` on a missing OR empty file
+ * silently opens a new empty session in its place, so both are dropped.
+ */
+function pruneRestoredPiSessions(windows: SavedWindow[]): void {
+  let dropped = 0;
+  for (const state of windows) {
+    for (const ws of state.workspaces ?? []) {
+      const result = pruneDeadPiSessions(ws.splitTree);
+      ws.splitTree = result.tree;
+      dropped += result.dropped;
+    }
+  }
+  if (dropped > 0) {
+    console.log(`[pi-resume] dropped ${dropped} session file(s) that are gone, empty or invalid`);
+  }
+}
 
 /** The same pruning for Qwen Code: a `qwen --resume` of a deleted session exits 1. */
 function pruneRestoredQwenSessions(windows: SavedWindow[]): void {
@@ -1394,6 +1504,40 @@ function pruneRestoredQwenSessions(windows: SavedWindow[]): void {
   }
   if (dropped > 0) {
     console.log(`[qwen-resume] dropped ${dropped} session id(s) with no transcript`);
+  }
+}
+
+/**
+ * Delivers a translated notice (an i18n KEY, never English text) to a
+ * surface's pane across all windows. Attaches a did-finish-load listener if a
+ * window is still loading so startup notices are not lost.
+ */
+function deliverPaneNotice(surfaceId: string, key: string): void {
+  const script = `window.__wmux_paneNoticeKey?.(${JSON.stringify(surfaceId)}, ${JSON.stringify(key)}) === true`;
+  const deliverToWindow = (win: BrowserWindow) => {
+    if (win.isDestroyed()) return;
+    if (win.webContents.isLoading()) {
+      win.webContents.once('did-finish-load', () => {
+        if (!win.isDestroyed()) {
+          win.webContents.executeJavaScript(script).catch(() => {});
+        }
+      });
+    } else {
+      win.webContents.executeJavaScript(script).catch(() => {});
+    }
+  };
+
+  const windows = BrowserWindow.getAllWindows();
+  if (windows.length === 0) {
+    setImmediate(() => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        deliverToWindow(win);
+      }
+    });
+  } else {
+    for (const win of windows) {
+      deliverToWindow(win);
+    }
   }
 }
 
@@ -1429,7 +1573,7 @@ process.on('uncaughtExceptionMonitor', (err: unknown) => {
   });
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // A losing second instance is already quitting; don't run startup side effects.
   if (!gotInstanceLock) return;
 
@@ -1462,7 +1606,7 @@ app.whenReady().then(() => {
   // the last responder from overwriting every other window's workspaces —
   // before this, a second window silently cost you the first one's tabs and
   // browser pages on the next 30s tick (issue #118).
-  ipcMain.on('session:save', (event, data: SessionData) => {
+  ipcMain.on(IPC_CHANNELS.SESSION_SAVE, (event, data: SessionData, token?: string) => {
     const state = data?.windows?.[0];
     if (!state) return;
     // Before anything downstream copies this tree (issue #186).
@@ -1476,25 +1620,23 @@ app.whenReady().then(() => {
     }
 
     const windowId = windowManager.idForWebContents(event.sender);
-    if (windowId) {
-      sessionWindows.update(windowId, state);
-      // Forget windows the user closed — but never while quitting, when every
-      // window is being torn down and pruning would erase what we're saving.
-      if (!isQuitting) {
-        sessionWindows.retainOnly(windowManager.getAllWindows().map((w) => w.id));
-      }
-      const merged: SessionData = { version: 1, windows: sessionWindows.toArray() };
-      saveSession(merged);
-      maybeSnapshotSession(merged);
-    } else {
-      // Unattributable sender (a window created outside WindowManager). Better
-      // to persist its state alone than to drop the save entirely.
-      const lone: SessionData = { version: 1, windows: [state] };
-      saveSession(lone);
-      maybeSnapshotSession(lone);
+    if (!windowId || !win || win.isDestroyed() || win.webContents !== event.sender) return;
+    // Never prune during shutdown, when the slots being destroyed are exactly
+    // the ones the next launch must restore.
+    if (!isQuitting) {
+      sessionWindows.retainOnly(windowManager.getAllWindows().map((w) => w.id));
     }
-    sessionFlush.notifySaved(event.sender.id);
+    const saved = terminalHistory.saveWindow(event.sender.id, state);
+    if (saved) maybeSnapshotSession({ version: 1, windows: sessionWindows.toArray() });
+    sessionFlush.notifySaved(event.sender.id, token, saved);
     if (!isQuitting) scheduleAutoSave();
+  });
+
+  ipcMain.on(IPC_CHANNELS.SESSION_HISTORY_DONE, (event, token: unknown, success: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win.webContents !== event.sender
+      || !windowManager.idForWebContents(event.sender) || typeof success !== 'boolean') return;
+    sessionFlush.notifyHistory(event.sender.id, token, success);
   });
 
   registerIpcHandlers(windowManager, cdpProxy);
@@ -1506,13 +1648,30 @@ app.whenReady().then(() => {
       sessionSavePending = undefined;
       if (isQuitting) return;
       for (const win of BrowserWindow.getAllWindows()) {
-        if (!win.isDestroyed()) win.webContents.send('session:request');
+        if (!win.isDestroyed()) win.webContents.send(IPC_CHANNELS.SESSION_REQUEST);
       }
     }, 100);
   });
   // A wedged GPU process freezes every window while every PTY lives on
   // (issue #229); the renderer probes for frames, this restarts the process.
   installGpuWatchdog();
+
+  // Keep Windows awake dynamically when coding agents are working
+  const awakeManager = getAwakeManager();
+  awakeManager.onStateChange((state) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send(IPC_CHANNELS.AWAKE_STATE_CHANGED, state);
+      }
+    }
+  });
+  // Counted on every broadcast, and re-counted when the oldest `working`
+  // claim outlives WORKING_TRUST_MS — that downgrade is never broadcast.
+  bindAwakeToAgentStates(awakeManager, {
+    list: listAgentStates,
+    subscribe: onAgentStateBroadcast,
+    trustMs: WORKING_TRUST_MS,
+  });
 
   // Tree-kill whatever a previously CRASHED instance left running (issue #139).
   // `will-quit` — the only thing that calls killAll() — does not run on a crash,
@@ -1545,7 +1704,10 @@ app.whenReady().then(() => {
 
   // Clear stale session data on version change (clean start for upgrades/fresh installs)
   const previousVersion = savedVersion();
-  handleVersionChange(app.getVersion());
+  handleVersionChange(app.getVersion(), {
+    pending: () => terminalHistory.hasUpgrade(loadSession()),
+    prepare: (backup, session) => terminalHistory.prepareUpgrade(backup, session),
+  });
   // Did this update change the app icon? If so the taskbar may still draw the
   // old one (issues #137/#226) — the renderer asks for this once and turns it
   // into a bell notification pointing at Settings → General.
@@ -1564,19 +1726,14 @@ app.whenReady().then(() => {
   // up empty instead of cloning one, which would duplicate its surface ids —
   // and PTY id is surface id, so the clone would attach to live PTYs (#143).
   const savedSession = loadSession();
+  await terminalHistory.cleanupStartup(savedSession);
   const savedWindows = (savedSession?.windows ?? []).slice(0, MAX_RESTORED_WINDOWS);
   pruneRestoredClaudeSessions(savedWindows);
   pruneRestoredQwenSessions(savedWindows);
   pruneRestoredOmpSessions(savedWindows);
-  if (savedWindows.length === 0) {
-    sessionWindows.markStartup(windowManager.createWindow());
-  } else {
-    for (const saved of savedWindows) {
-      const id = windowManager.createWindow(saved.bounds, saved.maximized);
-      sessionWindows.prime(id, saved);
-      sessionWindows.markStartup(id);
-    }
-  }
+  pruneRestoredPiSessions(savedWindows);
+  verifyRestoredWorktrees(savedWindows, { showNotice: deliverPaneNotice });
+  openStartupWindows(savedWindows);
 
   // Everything wmux writes into ~/.claude and ~/.config/opencode now runs behind
   // a stored consent decision, and asks for one on first launch (issue #132).
@@ -1794,6 +1951,15 @@ app.whenReady().then(() => {
     // credentials into a web context for nothing. The agent LABEL derived from
     // it does cross, on its own channel; the command line never does.
     if (cmd.command === 'report_command') return;
+    // A notify from a process that outlived its pane (a detached job that
+    // inherited WMUX_SURFACE_ID) names a surface no window owns. Since #392
+    // each window keeps only notifications for surfaces it owns, so that one
+    // would be dropped everywhere; sent surface-less, the active workspace
+    // takes it as before. Only main knows which surfaces still exist.
+    if (cmd.command === 'notify' && cmd.surfaceId && !ptyManager.has(cmd.surfaceId as SurfaceId)) {
+      broadcastMetadataUpdate({ ...cmd, surfaceId: '' });
+      return;
+    }
     broadcastMetadataUpdate(cmd);
   });
 
@@ -1982,13 +2148,14 @@ app.whenReady().then(() => {
             const lines = Number.isFinite(rawLines)
               ? Math.min(Math.max(Math.floor(rawLines), 1), 10000)
               : 50;
+            const events = request.params?.events === true;
             // The surface's terminal is mounted in exactly one window; probe
             // each until one has it, keeping the first miss as the error.
             let result: { text?: string; error?: string } | null = null;
             for (const win of BrowserWindow.getAllWindows()) {
               if (win.isDestroyed()) continue;
               const r = await win.webContents.executeJavaScript(
-                `window.__wmux_readScreen?.(${JSON.stringify(surfaceId.id)}, ${lines})`
+                `window.__wmux_readScreen?.(${JSON.stringify(surfaceId.id)}, ${lines}, ${events})`
               );
               if (r && !r.error) { result = r; break; }
               if (r && !result) result = r;
@@ -2223,13 +2390,11 @@ app.whenReady().then(() => {
             // claimed it, the workspace because it is either that pane's owner
             // or a renderer's own active id. That is a stronger guarantee than
             // the old code had, which passed `params.paneId` through as `any`.
-            const result = agentManager.spawn({
+            const spawnAgent = await prepareAgentSpawn(workspaceId, [paneId]);
+            const result = spawnAgent({
               cmd, label: params.label, cwd: params.cwd, env: params.env,
               paneId: paneId as PaneId, workspaceId: workspaceId as WorkspaceId,
             });
-
-            const win = BrowserWindow.getAllWindows()[0];
-            if (win && !win.isDestroyed()) setupAgentPtyForwarding(result.surfaceId, win);
 
             BrowserWindow.getAllWindows().forEach(w => {
               if (!w.isDestroyed()) w.webContents.send(IPC_CHANNELS.AGENT_UPDATE, { type: 'spawned', ...result, paneId, workspaceId, label: params.label, replaceTab: !!params.replaceTab });
@@ -2260,8 +2425,8 @@ app.whenReady().then(() => {
             }
 
             const assignments = resolveAgentAssignments(strategy, agentParams.length, paneLoads);
-            const win = BrowserWindow.getAllWindows()[0];
-            respond({ agents: spawnAgentBatch(agentParams, assignments, workspaceId, win) });
+            const spawnAgent = await prepareAgentSpawn(workspaceId, assignments);
+            respond({ agents: spawnAgentBatch(agentParams, assignments, workspaceId, spawnAgent) });
           } catch (err: any) { respondError(-32000, err.message); }
         })();
         break;
@@ -2326,6 +2491,11 @@ app.whenReady().then(() => {
 
 app.on('before-quit', (event) => {
   isQuitting = true;
+  try {
+    getAwakeManager().dispose();
+  } catch {
+    /* ignore */
+  }
   // Cancel pending auto-save timer
   if (autoSaveTimer !== null) {
     clearTimeout(autoSaveTimer);
@@ -2383,15 +2553,32 @@ windowManager.beforeClose = (win, isLastWindow) => {
   return flushSessionFrom(win);
 };
 
+/** A boolean workspace pref that is on only when the user turned it on. */
+function workspacePrefOn(key: 'confirmAppClose' | 'closeToTray'): boolean {
+  try {
+    const prefs = loadSettings()['wmux-workspace-prefs'] as Record<string, unknown> | undefined;
+    return prefs?.[key] === true;
+  } catch { return false; }
+}
+
+// Close to tray (issue #442): the icon is up only while a window is hidden to
+// it — see app-tray.ts. Restoring is `showHiddenWindows`, and the icon comes
+// down through onVisibilityChanged once nothing is hidden any more.
+const appTray = new AppTray({
+  icon: getAppIcon,
+  onShow: () => { windowManager.showHiddenWindows(); },
+  onQuit: () => app.quit(),
+});
+windowManager.onVisibilityChanged = () => {
+  if (!windowManager.hasHiddenWindows()) appTray.destroy();
+};
+
 windowManager.closeGuard = {
-  enabled: () => {
-    try {
-      const prefs = loadSettings()['wmux-workspace-prefs'] as { confirmAppClose?: unknown } | undefined;
-      return prefs?.confirmAppClose === true;
-    } catch { return false; }
-  },
+  enabled: () => workspacePrefOn('confirmAppClose'),
   bypass: () => isQuitting || sessionEndHandled,
   ptyCount: () => ptyManager.count(),
+  toTray: () => workspacePrefOn('closeToTray'),
+  ensureTray: () => appTray.ensure(),
 };
 
 app.on('browser-window-created', (_event, win) => {
