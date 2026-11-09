@@ -494,11 +494,13 @@ export function resolveShellForCwd(shell: string, cwd: string | undefined): stri
 // to the Windows user's home.
 export function resolveSpawnCwd(raw: string | undefined): string {
   const cwd = expandPathVars(raw ?? '', process.env);
-  const fallback = process.env.USERPROFILE || 'C:\\';
+  const onWindows = process.platform === 'win32';
+  const fallback = onWindows ? (process.env.USERPROFILE || 'C:\\') : require('os').homedir();
   if (!cwd) return fallback;
 
-  // POSIX/WSL cwd: not a valid Win32 working dir at all (issue #60).
-  if (isPosixPath(cwd)) return fallback;
+  // POSIX/WSL cwd: not a valid Win32 working dir at all (issue #60). On Linux
+  // it is the normal case, so fall through to the directory check.
+  if (onWindows && isPosixPath(cwd)) return fallback;
 
   // Win32 cwd that no longer exists (deleted git worktree) or does not exist
   // yet (spawn ordered before `git worktree add` finished). Also rejects a path
