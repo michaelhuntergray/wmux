@@ -48,6 +48,7 @@ export const it: Translation = {
   'palette.category.workspaces': 'Aree di lavoro',
   'palette.category.themes': 'Temi',
   'palette.openMarkdown': 'Apri un file Markdown…',
+  'palette.allPanesLocked': 'Tutti i riquadri sono bloccati. Sbloccane uno per aprire un file.',
   'palette.current': 'corrente',
   'titlebar.help': 'Aiuto / Tutorial',
   'titlebar.devtools': 'Mostra/nascondi gli strumenti di sviluppo',
@@ -157,6 +158,9 @@ export const it: Translation = {
   'surfaceTab.close': 'Chiudi',
   'surfaceTab.closeOthers': 'Chiudi le altre',
   'surfaceTab.closeToRight': 'Chiudi quelle a destra',
+  'surfaceTab.lockPane': 'Blocca riquadro',
+  'surfaceTab.unlockPane': 'Sblocca riquadro',
+  'surfaceTab.lockedTooltip': 'Riquadro bloccato: agenti e schede spostate non possono entrarvi. Clicca per sbloccare.',
   // Tutorial iniziale
   'tutorial.skip': 'Salta',
   'tutorial.previous': 'Indietro',
@@ -495,6 +499,7 @@ export const it: Translation = {
   'diffPane.waitingForChanges': 'In attesa di modifiche...',
   'diffPane.hint': 'Le modifiche appariranno qui quando un agente modifica i file',
   'diffPane.noDiffAvailable': 'Nessuna differenza disponibile per {file}',
+  'diffPane.wrapLines': 'A capo automatico',
   // Terminale — modalità copia, barra di ricerca, notifica campanella
   'terminal.bell': 'Campanella del terminale',
   'terminal.uploadFailed': 'Caricamento su {host} non riuscito: {reason}',

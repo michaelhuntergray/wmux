@@ -80,6 +80,7 @@ export const zhTW: Translation = {
   'palette.category.themes': '主題',
   'palette.category.layouts': '版面',
   'palette.openMarkdown': '開啟 Markdown 檔案…',
+  'palette.allPanesLocked': '所有窗格都已鎖定。請解鎖其中一個以開啟檔案。',
   'palette.saveCurrentLayout': '將目前版面存成新的預設集',
   'palette.saveCurrentLayoutFailed': '沒有作用中的工作區可以存成版面。',
   'palette.newWorkspaceWithLayout': '新工作區：{name}',
@@ -209,6 +210,9 @@ export const zhTW: Translation = {
   'surfaceTab.close': '關閉',
   'surfaceTab.closeOthers': '關閉其他分頁',
   'surfaceTab.closeToRight': '關閉右側所有分頁',
+  'surfaceTab.lockPane': '鎖定窗格',
+  'surfaceTab.unlockPane': '解鎖窗格',
+  'surfaceTab.lockedTooltip': '窗格已鎖定：代理與移入的分頁無法進入。點擊即可解鎖。',
   // 導覽覆蓋層
   'tutorial.skip': '略過',
   'tutorial.previous': '上一步',
@@ -625,6 +629,7 @@ export const zhTW: Translation = {
   'diffPane.waitingForChanges': '等待變更中…',
   'diffPane.hint': '當 agent 編輯檔案時，差異會顯示在這裡',
   'diffPane.noDiffAvailable': '{file} 沒有可顯示的差異',
+  'diffPane.wrapLines': '長行自動換行',
   // 終端機 — 複製模式、尋找列、提示音通知
   'terminal.bell': '終端機提示音',
   'terminal.uploadFailed': '上傳到 {host} 失敗：{reason}',
@@ -662,8 +667,6 @@ export const zhTW: Translation = {
   'addressBar.engineAgent': 'agent',
   'addressBar.engineWebTitle': '在這個面板中瀏覽。由 wmux 自己操作頁面——不需要額外安裝。',
   'addressBar.engineAgentTitle': '讓這個分頁改用 wmux 外部的完整 Chrome，並在這裡觀看 agent 的操作。首次使用需要安裝。',
-  'addressBar.backAgent': 'agent 操作瀏覽器時無法使用瀏覽紀錄',
-  'addressBar.reloadViewer': '重新載入活動檢視器（不會重新載入 agent 所在的頁面）',
   // 還沒有頁面的瀏覽器分頁 (#232)。wmux 以前會開啟自己的
   // GitHub repo，之後還把它當成使用者自己選的網址記住。
   'browser.blank.title': '沒有開啟任何頁面',

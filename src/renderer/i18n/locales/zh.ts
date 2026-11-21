@@ -45,6 +45,7 @@ export const zh: Translation = {
   'palette.category.workspaces': '工作区',
   'palette.category.themes': '主题',
   'palette.openMarkdown': '打开 Markdown 文件…',
+  'palette.allPanesLocked': '所有窗格均已锁定。请解锁其中一个以打开文件。',
   'palette.current': '当前',
   'titlebar.help': '帮助 / 教程',
   'titlebar.devtools': '切换开发者工具',
@@ -154,6 +155,9 @@ export const zh: Translation = {
   'surfaceTab.close': '关闭',
   'surfaceTab.closeOthers': '关闭其他',
   'surfaceTab.closeToRight': '关闭右侧标签',
+  'surfaceTab.lockPane': '锁定窗格',
+  'surfaceTab.unlockPane': '解锁窗格',
+  'surfaceTab.lockedTooltip': '窗格已锁定：代理和移入的标签页无法进入。点击解锁。',
   // 新手引导
   'tutorial.skip': '跳过',
   'tutorial.previous': '上一步',
@@ -495,6 +499,7 @@ export const zh: Translation = {
   'diffPane.waitingForChanges': '等待更改...',
   'diffPane.hint': '代理编辑文件时，差异将显示在这里',
   'diffPane.noDiffAvailable': '{file} 没有可用的差异',
+  'diffPane.wrapLines': '长行自动换行',
   // 终端 — 复制模式、查找栏、响铃通知
   'terminal.bell': '终端响铃',
   'terminal.uploadFailed': '上传到 {host} 失败：{reason}',

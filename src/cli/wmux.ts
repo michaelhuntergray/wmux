@@ -431,11 +431,13 @@ const print = (v: any) => console.log(JSON.stringify(v, null, 2));
 const BROWSER_READY_MS = 5000;
 const CDP_NAVIGATE_MS = 30000;
 const CDP_WAIT_MS = 10000;
+/** Outwait the native engine's hard watchdog, not just web-engine action budgets. */
+const AGENT_BROWSER_COMMAND_TIMEOUT_MS = 35000;
 /** Pane split plus the executeJavaScript round-trips around it. */
 const BROWSER_SLACK_MS = 5000;
 
-/** The CLI deadline for a browser verb whose own server-side budget is `verbMs`. */
-const browserDeadline = (verbMs: number): number => BROWSER_READY_MS + verbMs + BROWSER_SLACK_MS;
+/** The engine is resolved in main, so either engine must fit inside this deadline. */
+const browserDeadline = (verbMs: number): number => BROWSER_READY_MS + Math.max(verbMs, AGENT_BROWSER_COMMAND_TIMEOUT_MS) + BROWSER_SLACK_MS;
 
 export interface BrowserRequest {
   method: string;
@@ -969,6 +971,32 @@ async function workspaceSave(rest: string[]): Promise<void> {
   console.log(`Wrote ${file}. Commit it; anyone opening it is shown every command before anything runs.`);
 }
 
+/**
+ * Relative paths resolve against the caller's cwd, which differs from the main
+ * process's. The Windows host reads the file even when the CLI runs in WSL, so
+ * preserve Windows paths before POSIX resolution can turn them into relative
+ * names, and let wslpath handle both distro files and Windows-mounted drives.
+ * Remote requests retain their existing path semantics.
+ */
+export function resolveMarkdownFilePath(filePath: string, {
+  cwd = process.cwd(),
+  platform = process.platform,
+  env = process.env,
+  remote = !!remoteTarget,
+}: { cwd?: string; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; remote?: boolean } = {}): string {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  if (remote || !isWslHost(env, platform)) return paths.resolve(cwd, filePath);
+  if (/^(?:[a-z]:[\\/]|[\\/]{2})/i.test(filePath)) return filePath;
+
+  const resolved = paths.resolve(cwd, filePath);
+  const converted = spawnSync('/usr/bin/wslpath', ['-w', resolved], { encoding: 'utf-8', timeout: 5000 });
+  if (converted.error || converted.status !== 0 || !converted.stdout.trim()) {
+    const reason = converted.error?.message || converted.stderr.trim() || 'wslpath returned no path';
+    throw new Error(`Cannot convert WSL Markdown path '${resolved}': ${reason}`);
+  }
+  return converted.stdout.replace(/\r?\n$/, '');
+}
+
 async function cmdMarkdown(args: string[]): Promise<void> {
   const sub = args[1];
   if (sub === 'set') {
@@ -985,8 +1013,7 @@ async function cmdMarkdown(args: string[]): Promise<void> {
         surfaceId, markdown: args.slice(contentFlag + 1, end).join(' '), title,
       }));
     } else if (fileFlag !== -1) {
-      // Resolve against the terminal's cwd — the main-process cwd differs.
-      const filePath = path.resolve(process.cwd(), args[fileFlag + 1] || '');
+      const filePath = resolveMarkdownFilePath(args[fileFlag + 1] || '');
       print(await sendV2('markdown.load_file', { surfaceId, filePath }));
     } else {
       console.error('Usage: wmux markdown set <id> --content <text> [--title T] | --file <path>'); process.exit(1);
@@ -997,7 +1024,7 @@ async function cmdMarkdown(args: string[]): Promise<void> {
   } else if (sub) {
     // One-shot: `wmux markdown <file>` — create a markdown surface and load the
     // file into it. Relative paths resolve against the caller's cwd.
-    const filePath = path.resolve(process.cwd(), sub);
+    const filePath = resolveMarkdownFilePath(sub);
     const created = await sendV2('surface.create', { type: 'markdown' });
     const surfaceId = created?.surfaceId;
     if (!surfaceId) { console.error('Failed to create markdown surface'); process.exit(1); }
@@ -2202,13 +2229,24 @@ export const COMMAND_SPECS = {
   'close-workspace': { usage: 'wmux close-workspace [workspaceId]' },
   'select-workspace': { usage: 'wmux select-workspace <workspaceId>' },
   'rename-workspace': { usage: 'wmux rename-workspace <workspaceId> <title>', passthrough: true },
+  'set-indicator': {
+    usage: 'wmux set-indicator [--workspace <id>] --text <text> [--color <#rrggbb|name>]\n'
+      + '  A small pill on the workspace; the title is not changed. Defaults to this pane\'s workspace.\n'
+      + '  Text is cut at 16 characters; an unusable colour falls back to the accent.',
+    value: ['--workspace', '--text', '--color'],
+  },
+  'clear-indicator': {
+    usage: 'wmux clear-indicator [--workspace <id>]',
+    value: ['--workspace'],
+  },
   'list-workspaces': { usage: 'wmux list-workspaces' },
   'current-workspace': { usage: 'wmux current-workspace [--surface <id>]', value: ['--surface'] },
   whoami: { usage: 'wmux whoami [--surface <id>]   (alias of current-workspace)', value: ['--surface'] },
 
   // Surface
   'new-surface': {
-    usage: 'wmux new-surface [--type terminal|browser|markdown|prompts|git] [--color-scheme NAME]',
+    usage: 'wmux new-surface [--type terminal|browser|markdown|prompts|git] [--color-scheme NAME]\n'
+      + '  Opens in the first unlocked pane; fails if every pane in the workspace is locked.',
     value: ['--type', '--color-scheme'],
   },
   'close-surface': { usage: 'wmux close-surface [surfaceId]' },
@@ -2254,7 +2292,8 @@ export const COMMAND_SPECS = {
   // Layout
   layout: {
     usage: 'wmux layout grid --count <N> [--type T] [--anchor-surface <id>] [--anchor-pane <id>] [--workspace <id>]\n'
-      + 'wmux layout agents --count <N> [--type T] [--coordinator-ratio R] [--anchor-surface <id>] [--anchor-pane <id>] [--workspace <id>]',
+      + 'wmux layout agents --count <N> [--type T] [--coordinator-ratio R] [--anchor-surface <id>] [--anchor-pane <id>] [--workspace <id>]\n'
+      + '  layout grid fails on a workspace with a locked pane; use layout agents, which keeps the anchor\'s lock.',
     value: ['--count', '--type', '--coordinator-ratio', '--anchor-surface', '--anchor-pane', '--workspace'],
   },
 
@@ -2269,6 +2308,7 @@ export const COMMAND_SPECS = {
     usage: [
       `wmux read-screen [--lines N] [--surface <id>] [--events]   ${SURFACE_NOTE}`,
       '  Text of the active buffer, plus which buffer it is, its size and the cursor.',
+      '  --lines N (default 50) is the last N lines of content: blank rows under the prompt don\'t count.',
       '  --events adds the pane\'s recent buffer switches and resizes, oldest first.',
     ].join('\n'),
     value: ['--lines', '--surface'],
@@ -2307,6 +2347,7 @@ export const COMMAND_SPECS = {
       'wmux agent spawn --cmd <C> [--label L] [--cwd D] [--pane P] [--workspace W] [--replace-tab]',
       'wmux agent spawn-batch --json \'[...]\' [--strategy distribute|stack|split] [--workspace W]',
       'wmux agent status <agentId> | list [--workspace <id>] | kill <agentId>',
+      '  Locked panes: --pane <locked> fails; without --pane, agents go to unlocked panes only (error if none).',
     ].join('\n'),
     value: ['--cmd', '--label', '--cwd', '--pane', '--workspace', '--json', '--strategy'],
     bool: ['--replace-tab'],
@@ -2493,6 +2534,26 @@ const COMMANDS: Record<CommandName, (args: string[]) => Promise<void> | void> = 
   'close-workspace': async (args) => print(await sendV2('workspace.close', { id: args[1] })),
   'select-workspace': async (args) => print(await sendV2('workspace.select', { id: args[1] })),
   'rename-workspace': async (args) => print(await sendV2('workspace.rename', { id: args[1], title: args[2] })),
+  'set-indicator': async (args) => {
+    // Scanned, not paired (#247): `--workspace --text SSH` must be refused, not
+    // sent with workspaceId "--text".
+    const { values } = flagsOrFail('set-indicator', args.slice(1), { value: ['--workspace', '--text', '--color'] });
+    const text = values['--text'];
+    if (!text?.trim()) {
+      fail('set-indicator', COMMAND_SPECS['set-indicator'], 'set-indicator requires --text <text> (use clear-indicator to remove it)');
+    }
+    const workspaceId = values['--workspace'];
+    const color = values['--color'];
+    print(await sendV2('workspace.set_indicator', {
+      text,
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(color ? { color } : {}),
+    }));
+  },
+  'clear-indicator': async (args) => {
+    const workspaceId = flagsOrFail('clear-indicator', args.slice(1), { value: ['--workspace'] }).values['--workspace'];
+    print(await sendV2('workspace.set_indicator', { text: '', ...(workspaceId ? { workspaceId } : {}) }));
+  },
   'list-workspaces': async () => print(await sendV2('workspace.list')),
   'current-workspace': cmdCurrentWorkspace,
   whoami: cmdCurrentWorkspace,
@@ -2671,6 +2732,7 @@ Usage: wmux <command> [options]
 System:     ping, identify, capabilities, list-windows, focus-window <id>, new-window
 Links:      open <url>   (open it in the wmux browser panel, per Settings → Browser → Links)
 Workspace:  new-workspace, close-workspace, select-workspace, rename-workspace, list-workspaces
+            set-indicator --text T [--color C] [--workspace id] | clear-indicator [--workspace id]
             current-workspace | whoami [--surface <id>]   (the workspace THIS pane is in)
 Remote:     ssh [ssh options] <user@host> [--title T]   (remote terminal in a new workspace)
             bridge [--port P] [--host H] [--wsl]   (expose this wmux's pipe over TCP, default 127.0.0.1:9787)

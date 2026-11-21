@@ -48,6 +48,7 @@ export const es: Translation = {
   'palette.category.workspaces': 'Espacios de trabajo',
   'palette.category.themes': 'Temas',
   'palette.openMarkdown': 'Abrir un archivo Markdown…',
+  'palette.allPanesLocked': 'Todos los paneles están bloqueados. Desbloquea uno para abrir un archivo.',
   'palette.current': 'actual',
   'titlebar.help': 'Ayuda / Tutorial',
   'titlebar.devtools': 'Mostrar u ocultar las herramientas de desarrollo',
@@ -158,6 +159,9 @@ export const es: Translation = {
   'surfaceTab.close': 'Cerrar',
   'surfaceTab.closeOthers': 'Cerrar las demás',
   'surfaceTab.closeToRight': 'Cerrar las de la derecha',
+  'surfaceTab.lockPane': 'Bloquear panel',
+  'surfaceTab.unlockPane': 'Desbloquear panel',
+  'surfaceTab.lockedTooltip': 'Panel bloqueado: no admite agentes ni pestañas movidas. Haz clic para desbloquear.',
   // Tutorial de bienvenida
   'tutorial.skip': 'Saltar',
   'tutorial.previous': 'Anterior',
@@ -496,6 +500,7 @@ export const es: Translation = {
   'diffPane.waitingForChanges': 'Esperando cambios...',
   'diffPane.hint': 'Los diffs aparecerán aquí cuando un agente edite archivos',
   'diffPane.noDiffAvailable': 'No hay diferencias disponibles para {file}',
+  'diffPane.wrapLines': 'Ajustar líneas largas',
   // Terminal — modo copia, barra de búsqueda, notificación de campana
   'terminal.bell': 'Campana del terminal',
   'terminal.uploadFailed': 'Error al subir a {host}: {reason}',

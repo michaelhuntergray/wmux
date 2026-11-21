@@ -28,6 +28,7 @@ import {
 } from './agent-browser-runtime';
 import { verifyRestoredWorktrees } from './git-worktree';
 import { handleBridgeV2 } from './v2-bridge';
+import { handleSetIndicator } from './workspace-indicator-rpc';
 import { distributeAgents, PaneLoadInfo } from './agent-manager';
 import {
   resolveSpawnTarget,
@@ -327,6 +328,12 @@ function routeSpecialV2(
   // that owns the other workspace.* methods. None of them can grant trust.
   if (WORKSPACE_MANIFEST_METHODS.has(request.method)) {
     handleWorkspaceManifestV2(request.method, request.params, respond, respondError, manifestHost);
+    return true;
+  }
+  // Asks every window, not the bridge's one, and errors on a miss: see workspace-indicator-rpc.ts.
+  if (request.method === 'workspace.set_indicator') {
+    handleSetIndicator(request.params, BrowserWindow.getAllWindows(), respond, respondError)
+      .catch((err: Error) => respondError(-32000, err.message));
     return true;
   }
   // get_engine/set_engine must be caught BEFORE the generic browser.*
@@ -1219,6 +1226,11 @@ function fixDashboardContentType(): void {
 // keep its line alive and say what it is doing, and only its own SubagentStop
 // or the session ending finish it — never the parent's Stop, which a
 // background subagent outlives.
+//
+// Some built-in subagents (`web-fetch`) fire no SubagentStart and no
+// SubagentStop (#464). Their line, created by their tool events, ends when the
+// parent's `Agent` call returns (`agentEnded`), and the parent's Stop is the
+// backstop for a line nothing ever announced (`inferred`).
 function applyHookLifecycle(params: any): void {
   const sid = params?.surfaceId as SurfaceId | undefined;
   if (!sid) return;
@@ -1229,15 +1241,16 @@ function applyHookLifecycle(params: any): void {
   // ended with it, or at least is no longer this session's to report.
   if (params.event === 'SessionStart' && params.freshSession === '1') endDeclaredSubagents(sid);
   applyBackgroundShells(sid, params);
+  if (typeof params.agentEnded === 'string' && params.agentEnded) reportSubagent(sid, { id: params.agentEnded, done: true });
   if (!agentId) {
     if (params.event === 'SubagentStop') markSubagentStop(sid);
     else if (params.event === 'Stop') markAllAgentsDone(sid);
     return;
   }
-  if (params.event === 'SubagentStart') reportSubagent(sid, { id: agentId, name, done: false });
+  if (params.event === 'SubagentStart') reportSubagent(sid, { id: agentId, name, done: false, inferred: false });
   else if (params.event === 'SubagentStop') reportSubagent(sid, { id: agentId, name, done: true });
   else if (params.event === 'PreToolUse') {
-    reportSubagent(sid, { id: agentId, name, detail: typeof params.tool === 'string' ? params.tool : undefined, toolUse: true });
+    reportSubagent(sid, { id: agentId, name, detail: typeof params.tool === 'string' ? params.tool : undefined, toolUse: true, inferred: true });
   }
 }
 

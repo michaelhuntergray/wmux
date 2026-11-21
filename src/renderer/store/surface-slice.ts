@@ -2,8 +2,11 @@ import { StateCreator } from 'zustand';
 import { v4 as uuid } from 'uuid';
 import { WorkspaceId, PaneId, SurfaceId, SurfaceRef, SurfaceType } from '../../shared/types';
 import { findLeaf, removeLeaf, splitNode, getAllPaneIds } from './split-utils';
+import { setLeafLocked } from './pane-lock';
 import { killSurfacePty } from './pty-teardown';
+import { forceResumeOnSpawn } from '../hooks/claude-resume-command';
 import { WorkspaceSlice } from './workspace-slice';
+import { beginAgentBrowserHandoff, canApplyAgentBrowserReadback, clearAgentBrowserHandoff, invalidateAgentBrowserReadback } from './agent-browser-handoff';
 
 // ─── PR badge teardown (issue #4, continued) ──────────────────────────────────
 //
@@ -175,6 +178,9 @@ export interface SurfaceSlice {
   /** Move a surface from one pane to another (drag-and-drop) */
   moveSurface: (workspaceId: WorkspaceId, sourcePaneId: PaneId, surfaceId: SurfaceId, targetPaneId: PaneId) => void;
 
+  /** Lock or unlock a pane: agent spawns and tabs moved in from other panes are refused while locked. */
+  setPaneLocked: (workspaceId: WorkspaceId, paneId: PaneId, locked: boolean) => void;
+
   /** Reorder a surface within the same pane (drag to new tab position) */
   reorderSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId, newIndex: number) => void;
 
@@ -286,9 +292,60 @@ interface ClosedSurface {
    * prevent (see usableSticky in explorer-state.ts).
    */
   workspaceId?: WorkspaceId;
+  /**
+   * The agent conversation this tab was hosting when it closed, so Ctrl+Shift+T
+   * brings back the conversation and not a bare shell. Kept ONLY on the newest
+   * entry: pushing a later close strips it from everything older, so popping
+   * further back reopens plain shells. Resuming a conversation is the right
+   * undo for the tab you just closed by accident; ten closes later it is a
+   * surprise agent starting in a tab you no longer remember.
+   */
+  agentSession?: { field: AgentSessionField; id: string };
 }
 const closedSurfaceStack: ClosedSurface[] = [];
 const MAX_CLOSED_SURFACES = 25;
+
+/** The SurfaceRef field each provider's resume handle lives in. */
+const AGENT_SESSION_FIELD = {
+  claude: 'claudeSessionId',
+  codex: 'codexSessionId',
+  opencode: 'opencodeSessionId',
+  agy: 'agySessionId',
+  qwen: 'qwenSessionId',
+  omp: 'ompSessionId',
+  pi: 'piSessionFile',
+} as const satisfies Record<string, keyof SurfaceRef>;
+type AgentSessionField = (typeof AGENT_SESSION_FIELD)[keyof typeof AGENT_SESSION_FIELD];
+
+type AgentStateView = { sessionId?: string | null; sessionProvider?: string | null };
+
+/**
+ * The agent session a surface holds right now, or undefined.
+ *
+ * Main's live record wins — the renderer mirrors it in `agentStates`. An entry
+ * with no sessionId means the agent released its session (exited normally),
+ * which must NOT fall back to a stamped id: the user left that conversation.
+ * Only a surface main has never reported on (a restored tab whose agent has
+ * not spoken yet) falls back to the handle session.json gave it — the same
+ * precedence `providerLookup` applies at save time.
+ */
+function agentSessionOf(
+  surface: SurfaceRef,
+  agentStates: Record<string, AgentStateView | undefined> | undefined,
+): ClosedSurface['agentSession'] {
+  if (surface.type !== 'terminal') return undefined;
+  const live = agentStates?.[surface.id];
+  if (live) {
+    if (!live.sessionId) return undefined;
+    // An absent provider is Claude: that is what every report before #261 meant.
+    const field = AGENT_SESSION_FIELD[(live.sessionProvider ?? 'claude') as keyof typeof AGENT_SESSION_FIELD];
+    return field ? { field, id: live.sessionId } : undefined;
+  }
+  const stamped = Object.values(AGENT_SESSION_FIELD).filter((f) => typeof surface[f] === 'string' && surface[f]);
+  // Two providers' handles on one tab is ambiguous; resume neither.
+  if (stamped.length !== 1) return undefined;
+  return { field: stamped[0], id: surface[stamped[0]] as string };
+}
 
 // Workspaces where the user closed the auto-opened diff tab (issue #141).
 // Session-scoped, like the reopen stack: closing it used to last only until the
@@ -309,7 +366,7 @@ export function isDiffTabDismissed(workspaceId: WorkspaceId): boolean {
  * stale one via Ctrl+Shift+T is noise — but the close still has to be recorded,
  * or the next Edit/Write hook puts the tab straight back (issue #141).
  */
-function pushClosedSurface(workspaceId: WorkspaceId, surface: SurfaceRef): void {
+function pushClosedSurface(workspaceId: WorkspaceId, surface: SurfaceRef, get: () => SliceState): void {
   if (surface.type === 'diff') {
     diffTabDismissed.add(workspaceId);
     return;
@@ -317,6 +374,10 @@ function pushClosedSurface(workspaceId: WorkspaceId, surface: SurfaceRef): void 
   // A preview tab is disposable by definition — Ctrl+Shift+T should bring
   // back the tab the user meant to keep, not the last thing they glanced at.
   if (surface.ephemeral) return;
+  // Only the most recent close may resume an agent (see ClosedSurface.agentSession).
+  for (const older of closedSurfaceStack) delete older.agentSession;
+  const agentStates = (get() as unknown as { agentStates?: Record<string, AgentStateView | undefined> }).agentStates;
+  const agentSession = agentSessionOf(surface, agentStates);
   closedSurfaceStack.push({
     type: surface.type,
     colorScheme: surface.colorScheme,
@@ -337,6 +398,7 @@ function pushClosedSurface(workspaceId: WorkspaceId, surface: SurfaceRef): void 
     codeRootSurfaceId: surface.codeRootSurfaceId,
     explorerRootSurfaceId: surface.explorerRootSurfaceId,
     workspaceId,
+    ...(agentSession ? { agentSession } : {}),
   });
   if (closedSurfaceStack.length > MAX_CLOSED_SURFACES) closedSurfaceStack.shift();
 }
@@ -462,7 +524,7 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     // this action, and neither used to kill the PTY (only the tab-× button did).
     const closing = leaf.surfaces.find((s) => s.id === surfaceId);
     if (closing) {
-      pushClosedSurface(workspaceId, closing);
+      pushClosedSurface(workspaceId, closing, get);
       killSurfacePty(closing);
       clearPrIfOwner(get, workspaceId, [closing.id]);
     }
@@ -539,7 +601,7 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     const dropped: SurfaceId[] = [];
     for (const s of leaf.surfaces) {
       if (s.id === keepSurfaceId) continue;
-      pushClosedSurface(workspaceId, s);
+      pushClosedSurface(workspaceId, s, get);
       killSurfacePty(s);
       dropped.push(s.id);
     }
@@ -567,7 +629,7 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     // mirroring the bookkeeping in closeSurface (issues #64, #65).
     const dropped = leaf.surfaces.slice(idx + 1);
     for (const s of dropped) {
-      pushClosedSurface(workspaceId, s);
+      pushClosedSurface(workspaceId, s, get);
       killSurfacePty(s);
     }
     clearPrIfOwner(get, workspaceId, dropped.map((s) => s.id));
@@ -615,6 +677,7 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     const sourceLeaf = findLeaf(ws.splitTree, sourcePaneId);
     const targetLeaf = findLeaf(ws.splitTree, targetPaneId);
     if (!sourceLeaf || !targetLeaf) return;
+    if (targetLeaf.locked === true) return;
 
     // Find the surface in the source
     const surfaceIndex = sourceLeaf.surfaces.findIndex((s) => s.id === surfaceId);
@@ -645,6 +708,16 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
       });
     }
 
+    updateSplitTree(workspaceId, tree);
+  },
+
+  setPaneLocked(workspaceId, paneId, locked) {
+    const { workspaces, updateSplitTree } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return;
+
+    const tree = setLeafLocked(ws.splitTree, paneId, locked);
+    if (tree === ws.splitTree) return;
     updateSplitTree(workspaceId, tree);
   },
 
@@ -699,6 +772,16 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
         codeRelPath: restored.codeRelPath,
         ...(rootAlive ? { codeRootSurfaceId: restored.codeRootSurfaceId } : {}),
       });
+    }
+    if (reopenedId && restored.agentSession && restored.type === 'terminal') {
+      // Stamped before the terminal mounts (this all runs before React renders),
+      // so the PTY's first create sees the handle and folds the resume into its
+      // startup — the same path a restored tab takes, with the same validation.
+      // forceResumeOnSpawn lifts the restore-on-startup preference for this one
+      // surface: those prefs exist so a restart does not launch an agent in
+      // every pane at once, and Ctrl+Shift+T is the user asking for exactly one.
+      updateSurface(workspaceId, paneId, reopenedId, { [restored.agentSession.field]: restored.agentSession.id });
+      forceResumeOnSpawn(reopenedId);
     }
     if (reopenedId && restored.explorerRootSurfaceId && restored.workspaceId === workspaceId) {
       const ws = get().workspaces.find((w) => w.id === workspaceId);
@@ -755,6 +838,35 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     const leaf = findLeaf(ws.splitTree, paneId);
     if (!leaf) return;
 
+    const surface = leaf.surfaces.find((s) => s.id === surfaceId);
+    if (surface?.type === 'browser' && 'browserEngine' in patch && patch.browserEngine !== surface.browserEngine) {
+      if (patch.browserEngine === 'agent') clearAgentBrowserHandoff(surfaceId);
+      else if (surface.browserEngine === 'agent') {
+        const handoff = beginAgentBrowserHandoff(surfaceId);
+        void handoff.then((result) => {
+          if (!result?.url || !canApplyAgentBrowserReadback(surfaceId, handoff)) return;
+          // The view may be absent, or the surface may have moved while Chrome
+          // closed. Persist readback only into this still-Web surface, wherever
+          // it now lives; a later engine switch/real close invalidates it.
+          for (const currentWs of get().workspaces) {
+            for (const currentPaneId of getAllPaneIds(currentWs.splitTree)) {
+              const currentLeaf = findLeaf(currentWs.splitTree, currentPaneId);
+              const current = currentLeaf?.surfaces.find((s) => s.id === surfaceId);
+              if (currentLeaf && current?.type === 'browser' && current.browserEngine !== 'agent') {
+                // Apply readback directly: routing this through updateSurface's
+                // navigation fence would invalidate the view's matching answer.
+                get().updateSplitTree(currentWs.id, patchLeaf(currentWs.splitTree, currentPaneId, {
+                  surfaces: currentLeaf.surfaces.map((s) => s.id === surfaceId ? { ...s, url: result.url } : s),
+                }));
+                return;
+              }
+            }
+          }
+        });
+      }
+    }
+    if (surface?.type === 'browser' && surface.browserEngine !== 'agent'
+      && 'url' in patch && patch.url !== surface.url) invalidateAgentBrowserReadback(surfaceId);
     const newSurfaces = leaf.surfaces.map((s) => (s.id === surfaceId ? { ...s, ...patch } : s));
     const updatedTree = patchLeaf(ws.splitTree, paneId, { surfaces: newSurfaces });
     updateSplitTree(workspaceId, updatedTree);

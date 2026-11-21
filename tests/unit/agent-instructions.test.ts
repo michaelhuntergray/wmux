@@ -85,3 +85,13 @@ describe('cli-bin dir written into the block on Linux (MIC-627)', () => {
     expect(getCliBinDirForInstructions('win32', { APPIMAGE: 'x', HOME: 'C:\\u' })).not.toMatch(/share[\\/]wmux/);
   });
 });
+
+describe('locked panes in the on-demand instruction text', () => {
+  const raw = fs.readFileSync(getInstructionsPath(), 'utf-8');
+
+  it('says in the Locked panes section that wmux markdown skips locked panes too', () => {
+    const section = raw.split(/^## /m).find((s) => s.startsWith('Locked panes'));
+    expect(section).toBeDefined();
+    expect(section).toMatch(/`wmux markdown <file>`[^]*skips locked panes/);
+  });
+});

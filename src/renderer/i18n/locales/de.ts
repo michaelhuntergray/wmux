@@ -48,6 +48,7 @@ export const de: Translation = {
   'palette.category.workspaces': 'Arbeitsbereiche',
   'palette.category.themes': 'Designs',
   'palette.openMarkdown': 'Markdown-Datei öffnen…',
+  'palette.allPanesLocked': 'Alle Bereiche sind gesperrt. Entsperre einen, um eine Datei zu öffnen.',
   'palette.current': 'aktuell',
   'titlebar.help': 'Hilfe / Tutorial',
   'titlebar.devtools': 'Entwicklertools umschalten',
@@ -157,6 +158,9 @@ export const de: Translation = {
   'surfaceTab.close': 'Schließen',
   'surfaceTab.closeOthers': 'Andere schließen',
   'surfaceTab.closeToRight': 'Rechte schließen',
+  'surfaceTab.lockPane': 'Bereich sperren',
+  'surfaceTab.unlockPane': 'Bereich entsperren',
+  'surfaceTab.lockedTooltip': 'Bereich gesperrt: Agenten und verschobene Tabs kommen nicht hinein. Zum Entsperren klicken.',
   // Einführungstutorial
   'tutorial.skip': 'Überspringen',
   'tutorial.previous': 'Zurück',
@@ -495,6 +499,7 @@ export const de: Translation = {
   'diffPane.waitingForChanges': 'Warte auf Änderungen...',
   'diffPane.hint': 'Diffs erscheinen hier, wenn ein Agent Dateien bearbeitet',
   'diffPane.noDiffAvailable': 'Kein Diff verfügbar für {file}',
+  'diffPane.wrapLines': 'Lange Zeilen umbrechen',
   // Terminal — Kopiermodus, Suchleiste, Klingelbenachrichtigung
   'terminal.bell': 'Terminal-Klingel',
   'terminal.uploadFailed': 'Upload auf {host} fehlgeschlagen: {reason}',

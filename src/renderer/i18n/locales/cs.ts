@@ -56,6 +56,7 @@ export const cs: Translation = {
   'palette.category.themes': 'Motivy',
   'palette.category.layouts': 'Rozložení',
   'palette.openMarkdown': 'Otevřít soubor Markdown…',
+  'palette.allPanesLocked': 'Všechny panely jsou uzamčené. Odemkněte jeden, abyste mohli otevřít soubor.',
   'palette.saveCurrentLayout': 'Uložit aktuální rozložení jako novou předvolbu',
   'palette.saveCurrentLayoutFailed': 'Není aktivní žádný pracovní prostor, jehož rozložení lze uložit.',
   'palette.newWorkspaceWithLayout': 'Nový pracovní prostor: {name}',
@@ -177,6 +178,9 @@ export const cs: Translation = {
   'surfaceTab.close': 'Zavřít',
   'surfaceTab.closeOthers': 'Zavřít ostatní',
   'surfaceTab.closeToRight': 'Zavřít vpravo',
+  'surfaceTab.lockPane': 'Zamknout panel',
+  'surfaceTab.unlockPane': 'Odemknout panel',
+  'surfaceTab.lockedTooltip': 'Panel je zamčený: nelze do něj spouštět agenty ani přesouvat karty. Kliknutím odemknete.',
   // Úvodní příručka (overlay)
   'tutorial.skip': 'Přeskočit',
   'tutorial.previous': 'Zpět',
@@ -520,6 +524,7 @@ export const cs: Translation = {
   'diffPane.waitingForChanges': 'Čekání na změny...',
   'diffPane.hint': 'Zde se zobrazí rozdíly, jakmile agent upraví soubory',
   'diffPane.noDiffAvailable': 'Pro {file} není k dispozici žádný diff',
+  'diffPane.wrapLines': 'Zalamovat dlouhé řádky',
   // Git zobrazení projektu (#362)
   'git.baseTitle': 'Báze pro porovnání',
   'git.pickBase': 'Vyberte bázi…',
@@ -942,8 +947,6 @@ export const cs: Translation = {
   'addressBar.engineWebTitle': 'Procházejte web v tomto panelu. wmux ovládá stránku přímo — nic dalšího se neinstaluje.',
   'addressBar.engineAgentTitle':
     'Předejte tuto kartu skutečnému Chromu mimo wmux a zde sledujte, co v něm agent dělá. Vyžaduje jednorázovou instalaci.',
-  'addressBar.backAgent': 'Historie není dostupná, když prohlížeč ovládá agent',
-  'addressBar.reloadViewer': 'Znovu načíst přehled aktivity (neobnoví stránku, kterou používá agent)',
   'browser.blank.title': 'Není otevřená žádná stránka',
   'browser.blank.hint': 'Zadejte adresu URL nahoře nebo nastavte úvodní stránku v Nastavení → Prohlížeč.',
   'agentBrowser.setupTitle': 'Nechte agenta ovládat skutečný Chrome',

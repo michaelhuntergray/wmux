@@ -639,6 +639,21 @@ export default function App() {
     document.documentElement.classList.toggle('wmux-focus-mode', focusMode);
     try { localStorage.setItem('wmux-focus-mode', focusMode ? '1' : '0'); } catch { /* storage unavailable: keep the in-memory state */ }
   }, [focusMode]);
+  // A window without OS focus shows no focused pane, so two windows side by
+  // side do not both claim the keyboard. A class for the same reason as focus
+  // mode: no pane re-renders, and which pane is focused does not change.
+  useEffect(() => {
+    const api = window.wmux?.window;
+    if (!api?.onFocusChange) return;
+    const apply = (focused: boolean) =>
+      document.documentElement.classList.toggle('wmux-window-inactive', !focused);
+    const off = api.onFocusChange(apply);
+    api.isFocused?.().then(apply, () => { /* keep the default: active */ });
+    return () => {
+      off?.();
+      document.documentElement.classList.remove('wmux-window-inactive');
+    };
+  }, []);
   // The everyday strength of that same overlay, as a custom property for the
   // same reason: dragging the Settings slider re-renders no pane.
   const inactivePaneDim = useStore((s) => s.appearancePrefs.inactivePaneDim);
@@ -844,7 +859,11 @@ export default function App() {
       if (!ws) return [];
       return getAllPaneIds(ws.splitTree).map((pid) => {
         const leaf = findLeafFromTree(ws.splitTree, pid);
-        return { paneId: pid, tabCount: leaf ? leaf.surfaces.length : 0 };
+        return {
+          paneId: pid,
+          tabCount: leaf ? leaf.surfaces.length : 0,
+          ...(leaf?.locked ? { locked: true } : {}),
+        };
       });
     };
     // Which workspace owns this pane (#242). The split tree lives here and main
@@ -1389,11 +1408,25 @@ export default function App() {
     setExplorerOpen(byDefault || !!activeWorkspace?.explorerOpen);
   }, [activeWorkspaceId, activeWorkspace?.explorerOpen, activeWorkspace?.explorerDismissed, explorerOpenByDefault, workspaceHasRoot]);
 
+  // The pane each workspace last had focused (#449). Focus is one value per
+  // window, so a switch always lands on a pane the new workspace doesn't have;
+  // without this the reset below sent every return trip to the first pane.
+  // Recorded only while the pane belongs to the active workspace: on the render
+  // that switches, `focusedPaneId` is still the previous workspace's pane.
+  const lastFocusedPaneRef = useRef(new Map<WorkspaceId, PaneId>());
+  useEffect(() => {
+    if (!activeWorkspace || !focusedPaneId) return;
+    if (findLeaf(activeWorkspace.splitTree, focusedPaneId)) {
+      lastFocusedPaneRef.current.set(activeWorkspace.id, focusedPaneId);
+    }
+  }, [activeWorkspace?.id, activeWorkspace?.splitTree, focusedPaneId]);
+
   useEffect(() => {
     if (!activeWorkspace) return;
     const paneIds = getAllPaneIds(activeWorkspace.splitTree);
     if (paneIds.length > 0 && (focusedPaneId === null || !paneIds.includes(focusedPaneId))) {
-      setFocusedPaneId(paneIds[0]);
+      const remembered = lastFocusedPaneRef.current.get(activeWorkspace.id);
+      setFocusedPaneId(remembered && paneIds.includes(remembered) ? remembered : paneIds[0]);
     }
   }, [activeWorkspace?.id, activeWorkspace?.splitTree]);
 

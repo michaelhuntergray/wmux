@@ -55,6 +55,7 @@ export const ja: Translation = {
   'palette.category.workspaces': 'ワークスペース',
   'palette.category.themes': 'テーマ',
   'palette.openMarkdown': 'Markdown ファイルを開く…',
+  'palette.allPanesLocked': 'すべてのペインがロックされています。ファイルを開くには、いずれかのロックを解除してください。',
   'palette.current': '現在',
   // タイトルバー
   'titlebar.help': 'ヘルプ / チュートリアル',
@@ -168,6 +169,9 @@ export const ja: Translation = {
   'surfaceTab.close': '閉じる',
   'surfaceTab.closeOthers': '他を閉じる',
   'surfaceTab.closeToRight': '右側を閉じる',
+  'surfaceTab.lockPane': 'ペインをロック',
+  'surfaceTab.unlockPane': 'ペインのロックを解除',
+  'surfaceTab.lockedTooltip': 'ペインはロック中: エージェントや移動したタブは入れません。クリックで解除。',
   // チュートリアルオーバーレイ
   'tutorial.skip': 'スキップ',
   'tutorial.previous': '前へ',
@@ -506,6 +510,7 @@ export const ja: Translation = {
   'diffPane.waitingForChanges': '変更を待機中...',
   'diffPane.hint': 'エージェントがファイルを編集すると、ここに diff が表示されます',
   'diffPane.noDiffAvailable': '{file} の diff は利用できません',
+  'diffPane.wrapLines': '長い行を折り返す',
   // ターミナル — コピーモード、検索バー、ベルの通知
   'terminal.bell': 'ターミナルベル',
   'terminal.uploadFailed': '{host} へのアップロードに失敗しました: {reason}',

@@ -5,6 +5,7 @@
 import { useStore } from './store';
 import { splitNode, getAllPaneIds, findLeaf, buildGridLayout, buildAgentLayout, leafFraction, buildWorkspaceTree } from './store/split-utils';
 import { resolveAnchorPane, resolveLayoutSize } from './store/agent-layout-target';
+import { treeHasLockedPane, unlockedPaneIds } from './store/pane-lock';
 import { surfaceTerminalRegistry, showPaneNotice } from './hooks/useTerminal';
 import { rollupAgents } from './store/agent-rollup';
 import { toRemoteRosterSource } from './utils/remote-roster';
@@ -18,6 +19,7 @@ import { v4 as uuid } from 'uuid';
 import { buildManifestTree, describeWorkspaceTree, type ManifestWorkspaceSpec } from './store/manifest-tree';
 import { translate, type TranslationKey } from './i18n/core';
 import { isPosixPath, hostIsWindows } from '../shared/paths';
+import { normalizeIndicator } from '../shared/workspace-indicator';
 
 /** Non-hook context (bridges the main process to the store) — reads the current language directly. */
 const bridgeT = (key: TranslationKey, fallback?: string): string =>
@@ -361,6 +363,10 @@ export function initPipeBridge(): void {
     if (!anchorPaneId) anchorPaneId = paneIds[0];
     if (!anchorPaneId) return null;
 
+    if (treeHasLockedPane(ws.splitTree)) {
+      return { error: 'Workspace has locked panes; unlock them or use layout agents' };
+    }
+
     const surfaceType = (params.type || 'terminal') as SurfaceType;
     const { tree: newTree, newPaneIds } = buildGridLayout(ws.splitTree, anchorPaneId, count, surfaceType);
     store.updateSplitTree(wsId, newTree);
@@ -425,6 +431,7 @@ export function initPipeBridge(): void {
         surfaces: leaf?.surfaces?.map(s => ({ id: s.id, type: s.type })) || [],
         tabCount: leaf?.surfaces?.length || 0,
         activeSurfaceIndex: leaf?.activeSurfaceIndex ?? 0,
+        ...(leaf?.locked === true ? { locked: true } : {}),
       };
     });
   };
@@ -440,10 +447,10 @@ export function initPipeBridge(): void {
     if (!paneId) {
       const ws = store.workspaces.find(w => w.id === wsId);
       if (!ws) return null;
-      const paneIds = getAllPaneIds(ws.splitTree);
-      paneId = paneIds[0];
+      if (getAllPaneIds(ws.splitTree).length === 0) return null;
+      paneId = unlockedPaneIds(ws.splitTree)[0];
+      if (!paneId) return { error: `No unlocked panes in workspace ${wsId}` };
     }
-    if (!paneId) return null;
 
     const type = (params?.type || 'terminal') as SurfaceType;
     const surfaceId = store.addSurface(wsId, paneId, type, { colorScheme: params?.colorScheme });
@@ -580,6 +587,19 @@ export function initPipeBridge(): void {
       }
     }
     return null;
+  };
+
+  // `wmux set-indicator` / `clear-indicator`: the pill beside a workspace's
+  // name. Named by id, or else by the caller's surface. Null when this window
+  // holds neither, so main asks the next window and reports a miss
+  // (src/main/workspace-indicator-rpc.ts).
+  w.__wmux_setWorkspaceIndicator = (workspaceId: string, caller: string, text: string, color: string) => {
+    const id = workspaceId || w.__wmux_locateSurface(caller)?.workspaceId;
+    const store = useStore.getState();
+    if (!id || !store.workspaces.some(x => x.id === id)) return null;
+    const indicator = normalizeIndicator(text, color);
+    store.updateWorkspaceMetadata(id as WorkspaceId, { indicator });
+    return { workspaceId: id, indicator: indicator ?? null };
   };
 
   /**

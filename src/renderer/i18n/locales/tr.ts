@@ -55,6 +55,7 @@ export const tr: Translation = {
   'palette.category.workspaces': 'Çalışma Alanları',
   'palette.category.themes': 'Temalar',
   'palette.openMarkdown': 'Markdown Dosyası Aç…',
+  'palette.allPanesLocked': 'Tüm paneller kilitli. Dosya açmak için birinin kilidini açın.',
   'palette.current': 'geçerli',
   // Pencere başlığı
   'titlebar.help': 'Yardım / Eğitim',
@@ -168,6 +169,9 @@ export const tr: Translation = {
   'surfaceTab.close': 'Kapat',
   'surfaceTab.closeOthers': 'Diğerlerini kapat',
   'surfaceTab.closeToRight': 'Sağdakileri kapat',
+  'surfaceTab.lockPane': 'Paneli kilitle',
+  'surfaceTab.unlockPane': 'Panelin kilidini aç',
+  'surfaceTab.lockedTooltip': 'Panel kilitli: ajanlar ve taşınan sekmeler giremez. Kilidi açmak için tıklayın.',
   // Eğitim katmanı
   'tutorial.skip': 'Atla',
   'tutorial.previous': 'Önceki',
@@ -506,6 +510,7 @@ export const tr: Translation = {
   'diffPane.waitingForChanges': 'Değişiklikler bekleniyor...',
   'diffPane.hint': 'Bir aracı dosyaları düzenlediğinde alınan farklar burada görünür',
   'diffPane.noDiffAvailable': '{file} için fark yok',
+  'diffPane.wrapLines': 'Uzun satırları kaydır',
   // Terminal — kopyalama modu, bulma çubuğu, zil bildirimi
   'terminal.bell': 'Terminal zili',
   'terminal.uploadFailed': '{host} sunucusuna yükleme başarısız: {reason}',
