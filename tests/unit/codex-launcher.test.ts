@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import path from 'path';
 import { WebSocket } from 'ws';
 import { CodexSessionTracker } from '../../src/cli/codex-session-tracker';
@@ -499,6 +499,57 @@ describe.skipIf(process.platform !== 'win32')('PowerShell launcher arguments', (
     const bytes = pipeNonAscii('pwsh');
     expect(bytes.toString('utf8').trim()).toBe(nonAscii);
     expect(bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
+  });
+
+  // A caller function that sets its own ASCII $OutputEncoding shadows the global
+  // one; the shim must still pipe UTF-8.
+  const runScript = (host: string, body: (shim: string) => string) => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'wmux-codex-enc-'));
+    dirs.push(dir);
+    const capture = path.join(dir, 'capture.cjs');
+    const output = path.join(dir, 'stdin.bin');
+    writeFileSync(capture, `require('fs').writeFileSync(process.env.WMUX_TEST_OUTPUT,require('fs').readFileSync(0));`);
+    const script = path.join(dir, 'invoke.ps1');
+    const shim = path.resolve('src/codex-bin-ps/codex.ps1').replace(/'/g, "''");
+    writeFileSync(script, body(shim));
+    const result = spawnSync(host, ['-NoProfile', '-File', script], {
+      windowsHide: true, timeout: 20000, encoding: 'utf8',
+      env: { ...process.env, WMUX_CODEX_RUNTIME: process.execPath, WMUX_CODEX_LAUNCHER: capture, WMUX_TEST_OUTPUT: output },
+    });
+    return { result, output };
+  };
+  const callerAscii = (shim: string) => `function Invoke-Caller {
+  $OutputEncoding = [System.Text.Encoding]::ASCII
+  "caf$([char]0xE9) $([char]0x2713)" | & '${shim}' 'exec' '-'
+}
+Invoke-Caller
+`;
+  it('delivers UTF-8 under Windows PowerShell 5.1 when the caller scopes its own ASCII $OutputEncoding', () => {
+    const { result, output } = runScript('powershell.exe', callerAscii);
+    expect(result.status).toBe(0);
+    expect(require('fs').readFileSync(output, 'utf8').trim()).toBe(nonAscii);
+  });
+  it.skipIf(!pwshInstalled)('delivers UTF-8 under PowerShell 7 when the caller scopes its own ASCII $OutputEncoding', () => {
+    const { result, output } = runScript('pwsh', callerAscii);
+    expect(result.status).toBe(0);
+    expect(require('fs').readFileSync(output, 'utf8').trim()).toBe(nonAscii);
+  });
+
+  // A call with no piped input must not touch $OutputEncoding at all.
+  const readOnlyUnpiped = (shim: string) => `Set-Variable -Name OutputEncoding -Scope Global -Option ReadOnly -Force -Value ([System.Text.Encoding]::ASCII)
+$ErrorActionPreference = 'Stop'
+& '${shim}' 'exec' 'plain prompt'
+exit $LASTEXITCODE
+`;
+  it('does not touch a read-only $OutputEncoding on an unpiped call (5.1)', () => {
+    const { result } = runScript('powershell.exe', readOnlyUnpiped);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  });
+  it.skipIf(!pwshInstalled)('does not touch a read-only $OutputEncoding on an unpiped call (pwsh 7)', () => {
+    const { result } = runScript('pwsh', readOnlyUnpiped);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
   });
 });
 

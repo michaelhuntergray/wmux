@@ -11,10 +11,12 @@ $wmuxCodexPreviousArgs = $env:WMUX_CODEX_ARGLINE
 $wmuxCodexPiped = $MyInvocation.ExpectingInput
 # Windows PowerShell 5.1 encodes text piped to a native process with an ASCII
 # $OutputEncoding, so a piped 'cafe' with an accent reached codex as 'caf?'.
-# Use BOM-less UTF-8 for the call, and restore the session's value afterwards.
-# It must be the global variable: a script-scope copy is not what the pipe reads.
-$wmuxCodexPreviousEncoding = $global:OutputEncoding
-if ($wmuxCodexPiped) { $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false }
+# Use BOM-less UTF-8 for a piped call, in this script's own scope only. The pipe
+# reads the nearest $OutputEncoding, so this beats a caller's copy and the global
+# one, changes nothing outside the shim (nothing to restore, and a read-only global
+# is never written), and is skipped for unpiped calls. The [Encoding] type matters:
+# Windows PowerShell 5.1 ignores an untyped scope copy.
+if ($wmuxCodexPiped) { [System.Text.Encoding]$OutputEncoding = New-Object System.Text.UTF8Encoding $false }
 try {
     $argPassing = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction Ignore
     if ($argPassing -and "$argPassing" -ne 'Legacy') {
@@ -32,6 +34,5 @@ try {
     $wmuxCodexExit = $LASTEXITCODE
 } finally {
     $env:WMUX_CODEX_ARGLINE = $wmuxCodexPreviousArgs
-    $global:OutputEncoding = $wmuxCodexPreviousEncoding
 }
 exit $wmuxCodexExit
