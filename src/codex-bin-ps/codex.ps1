@@ -16,7 +16,11 @@ $wmuxCodexPiped = $MyInvocation.ExpectingInput
 # one, changes nothing outside the shim (nothing to restore, and a read-only global
 # is never written), and is skipped for unpiped calls. The [Encoding] type matters:
 # Windows PowerShell 5.1 ignores an untyped scope copy.
-if ($wmuxCodexPiped) { [System.Text.Encoding]$OutputEncoding = New-Object System.Text.UTF8Encoding $false }
+# If the variable is read-only and shared across scopes (AllScope), the assignment
+# can throw; keep the existing encoding then, and still forward stdin.
+if ($wmuxCodexPiped) {
+    try { [System.Text.Encoding]$OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+}
 try {
     $argPassing = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction Ignore
     if ($argPassing -and "$argPassing" -ne 'Legacy') {

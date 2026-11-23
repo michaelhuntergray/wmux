@@ -541,6 +541,25 @@ $ErrorActionPreference = 'Stop'
 & '${shim}' 'exec' 'plain prompt'
 exit $LASTEXITCODE
 `;
+  // AllScope makes the shim's scope share the read-only global, so assigning it
+  // throws; stdin must still be forwarded, with the encoding left as it was.
+  const readOnlyPiped = (shim: string) => `Set-Variable -Name OutputEncoding -Scope Global -Option AllScope,ReadOnly -Force -Value ([System.Text.Encoding]::ASCII)
+$ErrorActionPreference = 'Stop'
+'Reply PONG' | & '${shim}' 'exec' '-'
+exit $LASTEXITCODE
+`;
+  it('still forwards piped input when $OutputEncoding is AllScope and read-only (5.1)', () => {
+    const { result, output } = runScript('powershell.exe', readOnlyPiped);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(require('fs').readFileSync(output, 'utf8').trim()).toBe('Reply PONG');
+  });
+  it.skipIf(!pwshInstalled)('still forwards piped input when $OutputEncoding is AllScope and read-only (pwsh 7)', () => {
+    const { result, output } = runScript('pwsh', readOnlyPiped);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(require('fs').readFileSync(output, 'utf8').trim()).toBe('Reply PONG');
+  });
   it('does not touch a read-only $OutputEncoding on an unpiped call (5.1)', () => {
     const { result } = runScript('powershell.exe', readOnlyUnpiped);
     expect(result.stderr).toBe('');
