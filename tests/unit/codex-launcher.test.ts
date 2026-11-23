@@ -464,6 +464,42 @@ describe.skipIf(process.platform !== 'win32')('PowerShell launcher arguments', (
     });
     expect(require('fs').readFileSync(output, 'utf8').trim()).toBe('Reply PONG');
   });
+
+  // The piped text must reach codex as UTF-8. Windows PowerShell 5.1 pipes to
+  // native processes with an ASCII $OutputEncoding unless the shim sets it, so
+  // 'café' arrived as 'caf?'. The invoking script stays ASCII (5.1 reads a
+  // BOM-less script as ANSI) and builds the prompt from code points.
+  const nonAscii = 'café ✓';
+  const pipeNonAscii = (host: string) => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'wmux-codex-utf8-'));
+    dirs.push(dir);
+    const capture = path.join(dir, 'capture.cjs');
+    const output = path.join(dir, 'stdin.bin');
+    writeFileSync(capture, `require('fs').writeFileSync(process.env.WMUX_TEST_OUTPUT,require('fs').readFileSync(0));`);
+    const script = path.join(dir, 'invoke.ps1');
+    const shim = path.resolve('src/codex-bin-ps/codex.ps1').replace(/'/g, "''");
+    writeFileSync(script, `"caf$([char]0xE9) $([char]0x2713)" | & '${shim}' 'exec' '-'`);
+    execFileSync(host, ['-NoProfile', '-File', script], {
+      windowsHide: true, timeout: 20000,
+      env: { ...process.env, WMUX_CODEX_RUNTIME: process.execPath, WMUX_CODEX_LAUNCHER: capture, WMUX_TEST_OUTPUT: output },
+    });
+    return require('fs').readFileSync(output) as Buffer;
+  };
+  const pwshInstalled = (() => {
+    try { execFileSync('pwsh', ['-NoProfile', '-Command', 'exit 0'], { windowsHide: true, timeout: 20000 }); return true; } catch { return false; }
+  })();
+
+  it('delivers non-ASCII piped input as UTF-8 under Windows PowerShell 5.1', () => {
+    const bytes = pipeNonAscii('powershell.exe');
+    expect(bytes.toString('utf8').trim()).toBe(nonAscii);
+    expect(bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false); // no BOM
+  });
+
+  it.skipIf(!pwshInstalled)('delivers non-ASCII piped input as UTF-8 under PowerShell 7 with native argument passing', () => {
+    const bytes = pipeNonAscii('pwsh');
+    expect(bytes.toString('utf8').trim()).toBe(nonAscii);
+    expect(bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
+  });
 });
 
 describe.runIf(process.platform === 'win32')('codexShimDirs — which shell gets which shim', () => {

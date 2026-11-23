@@ -9,6 +9,12 @@ $wmuxCodexPreviousArgs = $env:WMUX_CODEX_ARGLINE
 # A script's pipeline input lands in $input, not in a native child's stdin (T-1181):
 # `'prompt' | codex exec -` reached codex with an empty stdin. Re-pipe it when present.
 $wmuxCodexPiped = $MyInvocation.ExpectingInput
+# Windows PowerShell 5.1 encodes text piped to a native process with an ASCII
+# $OutputEncoding, so a piped 'cafe' with an accent reached codex as 'caf?'.
+# Use BOM-less UTF-8 for the call, and restore the session's value afterwards.
+# It must be the global variable: a script-scope copy is not what the pipe reads.
+$wmuxCodexPreviousEncoding = $global:OutputEncoding
+if ($wmuxCodexPiped) { $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false }
 try {
     $argPassing = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction Ignore
     if ($argPassing -and "$argPassing" -ne 'Legacy') {
@@ -26,5 +32,6 @@ try {
     $wmuxCodexExit = $LASTEXITCODE
 } finally {
     $env:WMUX_CODEX_ARGLINE = $wmuxCodexPreviousArgs
+    $global:OutputEncoding = $wmuxCodexPreviousEncoding
 }
 exit $wmuxCodexExit
