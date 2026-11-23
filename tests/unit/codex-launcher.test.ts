@@ -447,6 +447,23 @@ describe.skipIf(process.platform !== 'win32')('PowerShell launcher arguments', (
       'Explain > and < & | literally', '-c', 'model="a b"', '', 'C:\\space dir\\',
     ]);
   });
+
+  // T-1181: `'prompt' | codex exec -` must reach codex's stdin through the shim.
+  it('forwards piped pipeline input to stdin', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'wmux-codex-stdin-'));
+    dirs.push(dir);
+    const capture = path.join(dir, 'capture.cjs');
+    const output = path.join(dir, 'stdin.txt');
+    writeFileSync(capture, `require('fs').writeFileSync(process.env.WMUX_TEST_OUTPUT,require('fs').readFileSync(0,'utf8'));`);
+    const script = path.join(dir, 'invoke.ps1');
+    const shim = path.resolve('src/codex-bin-ps/codex.ps1').replace(/'/g, "''");
+    writeFileSync(script, `'Reply PONG' | & '${shim}' 'exec' '-'`);
+    execFileSync('powershell.exe', ['-NoProfile', '-File', script], {
+      windowsHide: true, timeout: 10000,
+      env: { ...process.env, WMUX_CODEX_RUNTIME: process.execPath, WMUX_CODEX_LAUNCHER: capture, WMUX_TEST_OUTPUT: output },
+    });
+    expect(require('fs').readFileSync(output, 'utf8').trim()).toBe('Reply PONG');
+  });
 });
 
 describe.runIf(process.platform === 'win32')('codexShimDirs — which shell gets which shim', () => {
