@@ -9,6 +9,18 @@ $wmuxCodexPreviousArgs = $env:WMUX_CODEX_ARGLINE
 # A script's pipeline input lands in $input, not in a native child's stdin (T-1181):
 # `'prompt' | codex exec -` reached codex with an empty stdin. Re-pipe it when present.
 $wmuxCodexPiped = $MyInvocation.ExpectingInput
+# Windows PowerShell 5.1 encodes text piped to a native process with an ASCII
+# $OutputEncoding, so a piped 'cafe' with an accent reached codex as 'caf?'.
+# Use BOM-less UTF-8 for a piped call, in this script's own scope only. The pipe
+# reads the nearest $OutputEncoding, so this beats a caller's copy and the global
+# one, changes nothing outside the shim (nothing to restore, and a read-only global
+# is never written), and is skipped for unpiped calls. The [Encoding] type matters:
+# Windows PowerShell 5.1 ignores an untyped scope copy.
+# If the variable is read-only and shared across scopes (AllScope), the assignment
+# can throw; keep the existing encoding then, and still forward stdin.
+if ($wmuxCodexPiped) {
+    try { [System.Text.Encoding]$OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+}
 try {
     $argPassing = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction Ignore
     if ($argPassing -and "$argPassing" -ne 'Legacy') {
