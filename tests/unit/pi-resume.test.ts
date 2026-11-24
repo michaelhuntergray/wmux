@@ -143,7 +143,9 @@ describe('#382 pi report and save', () => {
     expect(getAgentState(SA)?.sessionProvider).toBe('pi');
   });
 
-  it('retains a WSL session through reporting, saving, and startup pruning without a Windows filesystem probe', () => {
+  // Windows host only: a POSIX path is a file inside WSL there. On a Linux host it is a
+  // native file, so pruning does probe it (see the pruning tests below).
+  it.skipIf(process.platform !== 'win32')('retains a WSL session through reporting, saving, and startup pruning without a Windows filesystem probe', () => {
     report(SA, WSL_FILE);
     expect(getAgentState(SA)?.sessionId).toBe(WSL_FILE);
     const tree = stampAgentSessionIds(leaf([terminal(SA)]));

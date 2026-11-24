@@ -120,8 +120,10 @@ function fileSize(file: string): number | null {
 /**
  * Drop saved pi handles that would resume nothing, before restore types them:
  * invalid (session.json is editable), gone, or empty — the two cases
- * `pi --session` silently turns into a brand-new session. Linux files are kept
- * without host-side existence checks, as with omp; Pi handles them inside WSL.
+ * `pi --session` silently turns into a brand-new session. On a Windows host a
+ * Linux file is kept without a host-side existence check, as with omp; Pi
+ * handles it inside WSL. On a Linux or macOS host a POSIX path is a native
+ * file and is checked like any other.
  */
 export function pruneDeadPiSessions<T>(
   tree: T,
@@ -132,7 +134,7 @@ export function pruneDeadPiSessions<T>(
   const pruned = mapSurfaces(tree, surface => {
     if (surface.type !== 'terminal' || surface.piSessionFile === undefined) return surface;
     const file = surface.piSessionFile;
-    if (isValidPiSessionFile(file, sessionsDir) && (file.startsWith('/') || (sizeOf(file) ?? 0) > 0)) return surface;
+    if (isValidPiSessionFile(file, sessionsDir) && ((process.platform === 'win32' && file.startsWith('/')) || (sizeOf(file) ?? 0) > 0)) return surface;
     dropped++;
     const rest = { ...surface };
     delete rest.piSessionFile;

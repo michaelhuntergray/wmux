@@ -76,6 +76,10 @@ export interface MarkdownImageError {
 export type ResolvedImage = { path: string } | MarkdownImageError;
 
 const win = path.win32;
+const posix = path.posix;
+
+/** A native POSIX path: absolute, and not the `//host` network form. */
+const isPosixAbsolute = (p: string) => p.startsWith('/') && !p.startsWith('//');
 
 const DRIVE_ABSOLUTE = /^[a-z]:[\\/]/i;
 const SCHEME = /^[a-z][a-z0-9+.-]+:/i;
@@ -161,6 +165,37 @@ function refuseRemote(candidate: string, doc: string | null): MarkdownImageError
 }
 
 /**
+ * The same rules on a POSIX host (Linux, macOS), where a document lives at
+ * `/home/me/notes/README.md` and a root-relative src is a real absolute path.
+ * Network forms (`//host`) stay refused, and so does any Windows drive path:
+ * it names nothing on this machine. `file:` URLs never get here: they are
+ * refused up front in `resolveImagePath`.
+ */
+function resolvePosixImagePath(doc: string | null, raw: string): ResolvedImage {
+  if (doc && !isAllowedMarkdownPath(doc)) return fail('unsupported_path', 'The document path is not a markdown file');
+  let candidate: string;
+  if (raw.startsWith('//') || raw.startsWith('\\\\')) {
+    return fail('unc_refused', 'Network images are refused');
+  } else if (raw.startsWith('/')) {
+    candidate = decode(stripSuffix(raw));
+  } else if (SCHEME.test(raw) || /^[a-z]:/i.test(raw)) {
+    return fail('unsupported_path', 'Unsupported image path');
+  } else {
+    if (!doc) return fail('unsupported_path', 'A relative image needs a document saved to disk');
+    candidate = posix.resolve(posix.dirname(doc), decode(stripSuffix(raw)));
+  }
+  if (!isPosixAbsolute(candidate)) return fail('unsupported_path', 'Unsupported image path');
+  return { path: posix.normalize(candidate) };
+}
+
+/** Whether this call is about a native POSIX file: only ever true on a non-Windows host. */
+function isNativePosix(documentPath: string | null | undefined, raw: string): boolean {
+  if (process.platform === 'win32') return false;
+  if (documentPath) return isPosixAbsolute(documentPath);
+  return isPosixAbsolute(raw);
+}
+
+/**
  * Where an image src points, given the document that names it. Pure: no
  * filesystem access, so the rules are testable without one.
  *
@@ -171,6 +206,10 @@ function refuseRemote(candidate: string, doc: string | null): MarkdownImageError
 export function resolveImagePath(documentPath: string | null | undefined, src: string): ResolvedImage {
   const raw = (src ?? '').trim();
   if (!raw) return fail('no_path', 'No image path');
+  // A POSIX host has no use for a file: URL, and every form of one (drive, dot
+  // segments, authority) is a way to name something this resolver should not.
+  if (process.platform !== 'win32' && /^file:/i.test(raw)) return fail('unsupported_path', 'file: URLs are not supported');
+  if (isNativePosix(documentPath, raw)) return resolvePosixImagePath(documentPath ?? null, raw);
 
   const doc = documentPath ? win.normalize(documentPath) : null;
   if (doc && (!isAllowedMarkdownPath(doc) || !(DRIVE_ABSOLUTE.test(doc) || uncShare(doc)))) {

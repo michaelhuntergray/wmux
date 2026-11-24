@@ -36,7 +36,8 @@ describe('resolveImagePath', () => {
     expect(resolveImagePath(DOC, 'D:/pics/b.png')).toEqual({ path: 'D:\\pics\\b.png' });
   });
 
-  it('accepts file: URLs, including localhost', () => {
+  // A POSIX host refuses every file: URL by design, see the POSIX describe below.
+  it.skipIf(process.platform !== 'win32')('accepts file: URLs, including localhost', () => {
     expect(resolveImagePath(DOC, 'file:///C:/My%20Pics/c.png')).toEqual({ path: 'C:\\My Pics\\c.png' });
     expect(resolveImagePath(DOC, 'file://localhost/C:/c.png')).toEqual({ path: 'C:\\c.png' });
     expect(resolveImagePath(DOC, 'file:/C:/c.png')).toEqual({ path: 'C:\\c.png' });
@@ -50,6 +51,9 @@ describe('resolveImagePath', () => {
   it('refuses UNC, protocol-relative and file://host — an NTLM leak to whoever wrote the doc', () => {
     expect(resolveImagePath(DOC, '\\\\evil\\share\\x.png')).toMatchObject({ code: 'unc_refused' });
     expect(resolveImagePath(DOC, '//evil/share/x.png')).toMatchObject({ code: 'unc_refused' });
+  });
+
+  it.skipIf(process.platform !== 'win32')('refuses file://host on a Windows host', () => {
     expect(resolveImagePath(DOC, 'file://evil/share/x.png')).toMatchObject({ code: 'unc_refused' });
   });
 
@@ -101,6 +105,51 @@ describe('sniffImageType / bytesMatchExtension', () => {
     expect(bytesMatchExtension('.svg', 'image/svg+xml')).toBe(true);
     expect(bytesMatchExtension('.png', null)).toBe(false);
     expect(bytesMatchExtension('.exe', 'image/png')).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('resolveImagePath on a POSIX host', () => {
+  const POSIX_DOC = '/home/me/notes/README.md';
+
+  it('resolves relative and absolute srcs against the document', () => {
+    expect(resolveImagePath(POSIX_DOC, 'img/a.png')).toEqual({ path: '/home/me/notes/img/a.png' });
+    expect(resolveImagePath(POSIX_DOC, '../b.png?raw=true')).toEqual({ path: '/home/me/b.png' });
+    expect(resolveImagePath(POSIX_DOC, '/srv/pics/c.png')).toEqual({ path: '/srv/pics/c.png' });
+    expect(resolveImagePath(null, '/srv/e.png')).toEqual({ path: '/srv/e.png' });
+  });
+
+  it('still refuses network forms, Windows drive paths and a relative src with no document', () => {
+    expect(resolveImagePath(POSIX_DOC, '//evil/share/x.png')).toMatchObject({ code: 'unc_refused' });
+    expect(resolveImagePath(POSIX_DOC, 'C:\\x.png')).toMatchObject({ code: 'unsupported_path' });
+    expect(resolveImagePath(null, 'shot.png')).toMatchObject({ code: 'unsupported_path' });
+  });
+
+  it('refuses every file: URL on a POSIX host, with or without a document', () => {
+    for (const src of [
+      'file:///home/me/a.png',
+      'FILE:///a.png',
+      'File:///a.png',
+      'file:///srv/My%20Pics/d.png',
+      'file://localhost/a.png',
+      'file://evil/share/x.png',
+      'file:/\\evil/share/x.png',
+      'file:///C:/../a.png',
+      'file:///C:/a.png',
+      'file:/C:/a.png',
+      'file:///C%3A/a.png',
+      'file:///%43:/a.png',
+      'file:///%2e/%43%3A/a.png',
+      'file:///./C:/a.png',
+      'file:///x/../C:/a.png',
+      'file:///%2E%2E/C%3A/a.png',
+    ]) {
+      expect(resolveImagePath(POSIX_DOC, src), src).toMatchObject({ code: 'unsupported_path' });
+      expect(resolveImagePath(null, src), `${src} (no document)`).toMatchObject({ code: 'unsupported_path' });
+    }
+  });
+
+  it('refuses a document that is not markdown', () => {
+    expect(resolveImagePath('/home/me/notes/run.sh', 'a.png')).toMatchObject({ code: 'unsupported_path' });
   });
 });
 

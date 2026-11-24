@@ -64,6 +64,22 @@ describe('Pi scoped instruction installation', () => {
     expect(fs.existsSync(dest())).toBe(false);
   });
 
+  it('keeps the host path.resolve result for a drive override on a Windows host', () => {
+    const real = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      process.env.PI_CODING_AGENT_DIR = 'C:/pi/agent/';
+      expect(getPiAgentDir()).toBe(path.resolve('C:/pi/agent/'));
+    } finally {
+      Object.defineProperty(process, 'platform', { value: real });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('reads a drive override as a Windows path on a POSIX host', () => {
+    process.env.PI_CODING_AGENT_DIR = 'C:/pi/agent/';
+    expect(getPiAgentDir()).toBe('C:\\pi\\agent\\');
+  });
+
   it('installs compact rules and a separate detailed reference, without a presence probe or global context', async () => {
     ensurePiExtension(BOTH);
     const guide = read(reference());

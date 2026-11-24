@@ -43,6 +43,10 @@ export function getPiAgentDir(): string {
     if (override.startsWith('~/') || override.startsWith('~\\')) {
       return path.join(os.homedir(), override.slice(2));
     }
+    // A drive-rooted override is already absolute. On a POSIX host path.resolve
+    // would treat it as a relative name and glue it onto the cwd. A Windows host
+    // keeps path.resolve, so its output is unchanged.
+    if (process.platform !== 'win32' && /^[a-zA-Z]:[\\/]/.test(override)) return path.win32.normalize(override);
     return path.resolve(override);
   }
   return path.join(os.homedir(), '.pi', 'agent');
