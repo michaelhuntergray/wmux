@@ -183,6 +183,8 @@ function resolvePosixImagePath(doc: string | null, raw: string): ResolvedImage {
       if (host && host.toLowerCase() !== 'localhost') return fail('unc_refused', 'Network images are refused');
     }
     candidate = decode(stripSuffix(rest));
+    // Checked after decoding, so `file:///C%3A/x` and `file:///%43:/x` are caught too.
+    if (/^\/[a-z][:|]/i.test(candidate)) return fail('unsupported_path', 'Unsupported image path');
   } else if (raw.startsWith('//') || raw.startsWith('\\\\')) {
     return fail('unc_refused', 'Network images are refused');
   } else if (raw.startsWith('/')) {

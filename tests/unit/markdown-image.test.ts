@@ -122,6 +122,20 @@ describe.skipIf(process.platform === 'win32')('resolveImagePath on a POSIX host'
     expect(resolveImagePath(null, 'shot.png')).toMatchObject({ code: 'unsupported_path' });
   });
 
+  it('refuses drive-form file: URLs, including percent-encoded drive letters and colons', () => {
+    for (const src of [
+      'file:///C:/a.png',
+      'file:/C:/a.png',
+      'file:///C%3A/a.png',
+      'file:///C%3a/a.png',
+      'file:///%43:/a.png',
+      'file:///%43%3A/a.png',
+      'file://localhost/C%3A/a.png',
+    ]) {
+      expect(resolveImagePath(POSIX_DOC, src), src).toMatchObject({ code: 'unsupported_path' });
+    }
+  });
+
   it('refuses a document that is not markdown', () => {
     expect(resolveImagePath('/home/me/notes/run.sh', 'a.png')).toMatchObject({ code: 'unsupported_path' });
   });
