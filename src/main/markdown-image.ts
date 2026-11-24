@@ -167,26 +167,14 @@ function refuseRemote(candidate: string, doc: string | null): MarkdownImageError
 /**
  * The same rules on a POSIX host (Linux, macOS), where a document lives at
  * `/home/me/notes/README.md` and a root-relative src is a real absolute path.
- * Network forms (`//host`, `file://host`) stay refused, and so does any
- * Windows drive path: it names nothing on this machine.
+ * Network forms (`//host`) stay refused, and so does any Windows drive path:
+ * it names nothing on this machine. `file:` URLs never get here: they are
+ * refused up front in `resolveImagePath`.
  */
 function resolvePosixImagePath(doc: string | null, raw: string): ResolvedImage {
   if (doc && !isAllowedMarkdownPath(doc)) return fail('unsupported_path', 'The document path is not a markdown file');
   let candidate: string;
-  if (/^file:/i.test(raw)) {
-    let rest = raw.slice('file:'.length);
-    if (rest.startsWith('//')) {
-      rest = rest.slice(2);
-      const slash = rest.indexOf('/');
-      const host = slash >= 0 ? rest.slice(0, slash) : rest;
-      rest = slash >= 0 ? rest.slice(slash) : '';
-      if (host && host.toLowerCase() !== 'localhost') return fail('unc_refused', 'Network images are refused');
-    }
-    candidate = decode(stripSuffix(rest));
-    // Checked after decoding AND normalizing, so `file:///C%3A/x`, `file:///%43:/x`,
-    // `file:///./C:/x` and `file:///x/../C:/x` are all caught.
-    if (/^\/[a-z][:|]/i.test(posix.normalize(candidate))) return fail('unsupported_path', 'Unsupported image path');
-  } else if (raw.startsWith('//') || raw.startsWith('\\\\')) {
+  if (raw.startsWith('//') || raw.startsWith('\\\\')) {
     return fail('unc_refused', 'Network images are refused');
   } else if (raw.startsWith('/')) {
     candidate = decode(stripSuffix(raw));
@@ -204,10 +192,7 @@ function resolvePosixImagePath(doc: string | null, raw: string): ResolvedImage {
 function isNativePosix(documentPath: string | null | undefined, raw: string): boolean {
   if (process.platform === 'win32') return false;
   if (documentPath) return isPosixAbsolute(documentPath);
-  if (isPosixAbsolute(raw)) return true;
-  // `file:///home/me/a.png`, but not `file:///C:/a.png`.
-  const url = /^file:(?:\/\/(?:localhost)?)?(\/(?![a-z]:).*)$/i.exec(raw);
-  return url !== null;
+  return isPosixAbsolute(raw);
 }
 
 /**
@@ -221,6 +206,9 @@ function isNativePosix(documentPath: string | null | undefined, raw: string): bo
 export function resolveImagePath(documentPath: string | null | undefined, src: string): ResolvedImage {
   const raw = (src ?? '').trim();
   if (!raw) return fail('no_path', 'No image path');
+  // A POSIX host has no use for a file: URL, and every form of one (drive, dot
+  // segments, authority) is a way to name something this resolver should not.
+  if (process.platform !== 'win32' && /^file:/i.test(raw)) return fail('unsupported_path', 'file: URLs are not supported');
   if (isNativePosix(documentPath, raw)) return resolvePosixImagePath(documentPath ?? null, raw);
 
   const doc = documentPath ? win.normalize(documentPath) : null;
