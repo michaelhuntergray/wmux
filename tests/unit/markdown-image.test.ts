@@ -131,6 +131,11 @@ describe.skipIf(process.platform === 'win32')('resolveImagePath on a POSIX host'
       'file:///%43:/a.png',
       'file:///%43%3A/a.png',
       'file://localhost/C%3A/a.png',
+      'file:///%2e/%43%3A/a.png',
+      'file:///./C:/a.png',
+      'file:///x/../C:/a.png',
+      'file:///%2E%2E/C%3A/a.png',
+      'file:///a/b/../../C%3A/a.png',
     ]) {
       expect(resolveImagePath(POSIX_DOC, src), src).toMatchObject({ code: 'unsupported_path' });
     }
