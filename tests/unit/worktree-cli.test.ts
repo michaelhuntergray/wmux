@@ -120,7 +120,8 @@ describe('CLI worktree flags and parameter validation', () => {
 
     // #397: a Windows pane never takes a POSIX workspace cwd, so a workspace
     // created on one must name WSL or it would open PowerShell at home.
-    it('opens a workspace created on a POSIX folder with WSL panes', async () => {
+    // WSL exists only under a Windows host (hostIsWindows() in pipe-bridge.ts); elsewhere a POSIX cwd is native.
+    it.skipIf(process.platform !== 'win32')('opens a workspace created on a POSIX folder with WSL panes', async () => {
       const posix = await (window as any).__wmux_createWorkspace({ cwd: '/home/u/proj' });
       const named = await (window as any).__wmux_createWorkspace({ cwd: '/home/u/proj', shell: 'pwsh.exe' });
       const win = await (window as any).__wmux_createWorkspace({ cwd: 'C:\\repo' });

@@ -104,6 +104,29 @@ describe('sniffImageType / bytesMatchExtension', () => {
   });
 });
 
+describe.skipIf(process.platform === 'win32')('resolveImagePath on a POSIX host', () => {
+  const POSIX_DOC = '/home/me/notes/README.md';
+
+  it('resolves relative, absolute and file: srcs against the document', () => {
+    expect(resolveImagePath(POSIX_DOC, 'img/a.png')).toEqual({ path: '/home/me/notes/img/a.png' });
+    expect(resolveImagePath(POSIX_DOC, '../b.png?raw=true')).toEqual({ path: '/home/me/b.png' });
+    expect(resolveImagePath(POSIX_DOC, '/srv/pics/c.png')).toEqual({ path: '/srv/pics/c.png' });
+    expect(resolveImagePath(POSIX_DOC, 'file:///srv/My%20Pics/d.png')).toEqual({ path: '/srv/My Pics/d.png' });
+    expect(resolveImagePath(null, '/srv/e.png')).toEqual({ path: '/srv/e.png' });
+  });
+
+  it('still refuses network forms, Windows drive paths and a relative src with no document', () => {
+    expect(resolveImagePath(POSIX_DOC, '//evil/share/x.png')).toMatchObject({ code: 'unc_refused' });
+    expect(resolveImagePath(POSIX_DOC, 'file://evil/share/x.png')).toMatchObject({ code: 'unc_refused' });
+    expect(resolveImagePath(POSIX_DOC, 'C:\\x.png')).toMatchObject({ code: 'unsupported_path' });
+    expect(resolveImagePath(null, 'shot.png')).toMatchObject({ code: 'unsupported_path' });
+  });
+
+  it('refuses a document that is not markdown', () => {
+    expect(resolveImagePath('/home/me/notes/run.sh', 'a.png')).toMatchObject({ code: 'unsupported_path' });
+  });
+});
+
 describe('readMarkdownImage', () => {
   let dir: string;
   let doc: string;

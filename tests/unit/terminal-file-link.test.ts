@@ -36,7 +36,8 @@ describe('resolveTerminalFileLink inside the root', () => {
     });
   });
 
-  it('accepts backslashes and a leading ./', async () => {
+  // A backslash separates path parts only on Windows; on POSIX it is a file-name character.
+  it.skipIf(process.platform !== 'win32')('accepts backslashes and a leading ./', async () => {
     const result = await resolveTerminalFileLink(root, '.\\docs\\itch\\devlog\\0.5.md');
     expect(result).toMatchObject({ kind: 'jailed', relPath: 'docs/itch/devlog/0.5.md' });
   });
